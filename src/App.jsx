@@ -18,6 +18,8 @@ import {
   Cell,
   ComposedChart,
   Line,
+  ReferenceArea,
+  ReferenceLine,
   ResponsiveContainer,
   Scatter,
   Tooltip,
@@ -45,12 +47,60 @@ const COLORS = {
 const INVALID_DIGITAL = new Set([-32768, 32767]);
 const KNOWN_TYPES = ["STR", "BRP", "PLD", "SAD", "EVE", "CSL"];
 const SAMPLE_EDF_PATHS = [
+  "/sample-data/20260712/20260713_005314_CSL.crc",
   "/sample-data/20260712/20260713_005314_CSL.edf",
+  "/sample-data/20260712/20260713_005314_EVE.crc",
   "/sample-data/20260712/20260713_005314_EVE.edf",
+  "/sample-data/20260712/20260713_005316_BRP.crc",
   "/sample-data/20260712/20260713_005316_BRP.edf",
+  "/sample-data/20260712/20260713_005317_PLD.crc",
   "/sample-data/20260712/20260713_005317_PLD.edf",
+  "/sample-data/20260712/20260713_005317_SAD.crc",
   "/sample-data/20260712/20260713_005317_SAD.edf",
 ];
+
+let workerRequestId = 0;
+let edfWorker = null;
+
+function getEdfWorker() {
+  if (typeof Worker === "undefined") return null;
+  if (!edfWorker) {
+    edfWorker = new Worker(new URL("./edfWorker.js", import.meta.url), { type: "module" });
+  }
+  return edfWorker;
+}
+
+function requestWorkerFiles(type, entries, mode) {
+  const worker = getEdfWorker();
+  if (!worker) return null;
+  const id = workerRequestId + 1;
+  workerRequestId = id;
+
+  return new Promise((resolve, reject) => {
+    const handleMessage = (event) => {
+      if (event.data?.id !== id) return;
+      worker.removeEventListener("message", handleMessage);
+      if (event.data.ok) resolve(event.data.files);
+      else reject(new Error(event.data.error || "EDF worker failed"));
+    };
+    worker.addEventListener("message", handleMessage);
+    worker.postMessage({ id, type, entries, mode });
+  });
+}
+
+function toFileEntry(file) {
+  return {
+    file,
+    name: file.name,
+    relativePath: file.webkitRelativePath || file.relativePath || file.name,
+  };
+}
+
+function fileEntriesFromList(fileList) {
+  return [...fileList]
+    .filter((file) => /\.(edf|crc)$/i.test(file.name))
+    .map(toFileEntry);
+}
 
 function ascii(view, start, length) {
   let out = "";
@@ -256,6 +306,24 @@ function parseAllSignals(buffer, header) {
   return signals;
 }
 
+function signalLabelsForMode(header, mode) {
+  if (mode === "summary") return header.type === "STR" ? header.labels : [];
+  if (mode === "detail") return header.type === "PLD" || header.type === "SAD" ? header.labels : [];
+  if (mode === "flow") return header.type === "BRP" ? ["Flow.40ms", "Press.40ms"] : [];
+  if (mode === "all") return header.labels;
+  return [];
+}
+
+function parseSignalsForMode(buffer, header, mode) {
+  const labels = new Set(signalLabelsForMode(header, mode));
+  const signals = {};
+  header.labels.forEach((label, index) => {
+    if (label === "Crc16" || label === "EDF Annotations" || !labels.has(label)) return;
+    signals[label] = parseSignalSeries(buffer, header, index);
+  });
+  return signals;
+}
+
 function parseAnnotationText(text) {
   const events = [];
   const chunks = text.split("\u0000").filter(Boolean);
@@ -306,37 +374,62 @@ async function readFileBuffer(file) {
   });
 }
 
-async function parseEdfFile(file) {
+async function parseEdfFile(input, mode = "summary") {
+  const file = input.file || input;
+  const relativePath = input.relativePath || file.webkitRelativePath || file.name;
   const buffer = await readFileBuffer(file);
-  const header = parseEdfHeader(buffer, file.name || file.webkitRelativePath || "unknown.edf");
+  const header = parseEdfHeader(buffer, file.name || relativePath || "unknown.edf");
   const annotations = header.labels.includes("EDF Annotations") ? parseAnnotations(buffer, header) : [];
-  const signals = header.type === "STR" ? parseAllSignals(buffer, header) : {};
+  const signals = parseSignalsForMode(buffer, header, mode);
   return {
     fileName: file.name,
-    relativePath: file.webkitRelativePath || file.name,
+    relativePath,
     sourceFile: file,
     header,
     annotations,
     signals,
-    signalsLoaded: header.type === "STR" || header.labels.includes("EDF Annotations"),
+    signalsLoaded: mode === "all" || (mode === "summary" && header.type === "STR") || (mode === "detail" && (header.type === "PLD" || header.type === "SAD")) || (mode === "flow" && header.type === "BRP") || header.labels.includes("EDF Annotations"),
+    flowLoaded: mode === "flow" && header.type === "BRP",
   };
 }
 
-async function hydrateSignals(fileRecord) {
-  if (fileRecord.signalsLoaded) return fileRecord;
+async function hydrateSignals(fileRecord, mode = "detail") {
+  if ((mode === "detail" && fileRecord.signalsLoaded) || (mode === "flow" && fileRecord.flowLoaded)) return fileRecord;
   if (fileRecord.header.labels.includes("EDF Annotations")) {
     return { ...fileRecord, signalsLoaded: true };
   }
   const buffer = await readFileBuffer(fileRecord.sourceFile);
+  const signals = parseSignalsForMode(buffer, fileRecord.header, mode);
   return {
     ...fileRecord,
-    signals: parseAllSignals(buffer, fileRecord.header),
-    signalsLoaded: true,
+    signals: { ...fileRecord.signals, ...signals },
+    signalsLoaded: mode === "detail" ? true : fileRecord.signalsLoaded,
+    flowLoaded: mode === "flow" ? true : fileRecord.flowLoaded,
   };
 }
 
-async function hydrateSignalFiles(files) {
-  return Promise.all(files.map(hydrateSignals));
+async function hydrateSignalFiles(files, mode = "detail") {
+  const entries = files
+    .filter((file) => file.sourceFile)
+    .map((file) => ({ file: file.sourceFile, name: file.fileName, relativePath: file.relativePath }));
+  const workerResult = entries.length ? await requestWorkerFiles("hydrateFiles", entries, mode) : null;
+  if (workerResult) {
+    const byPath = new Map(workerResult.map((file) => [file.relativePath, file]));
+    return files.map((file) => {
+      const hydrated = byPath.get(file.relativePath);
+      if (!hydrated) return file;
+      return {
+        ...file,
+        ...hydrated,
+        sourceFile: file.sourceFile,
+        signals: { ...file.signals, ...hydrated.signals },
+        signalsLoaded: file.signalsLoaded || hydrated.signalsLoaded,
+        flowLoaded: file.flowLoaded || hydrated.flowLoaded,
+        crc: file.crc || hydrated.crc,
+      };
+    });
+  }
+  return Promise.all(files.map((file) => hydrateSignals(file, mode)));
 }
 
 function nearestAt(series, seconds) {
@@ -445,6 +538,32 @@ function buildSession(files) {
       }));
     })
     .sort((a, b) => a.onset - b.onset);
+  const segments = files
+    .filter((file) => ["BRP", "PLD", "SAD"].includes(file.header.type) && file.header.recordDuration > 0)
+    .map((file) => {
+      const start = relativeStart(file, groupStartMs);
+      const end = start + file.header.recordCount * file.header.recordDuration;
+      return {
+        type: file.header.type,
+        start,
+        end,
+        startLabel: timeLabel(start),
+        endLabel: timeLabel(end),
+        fileName: file.fileName,
+      };
+    })
+    .sort((a, b) => a.start - b.start);
+  const gaps = [];
+  for (let i = 1; i < segments.length; i += 1) {
+    if (segments[i].start - segments[i - 1].end > 60) {
+      gaps.push({
+        start: segments[i - 1].end,
+        end: segments[i].start,
+        startLabel: timeLabel(segments[i - 1].end),
+        endLabel: timeLabel(segments[i].start),
+      });
+    }
+  }
   const therapySeconds = Math.max(
     0,
     ...files
@@ -523,6 +642,8 @@ function buildSession(files) {
       pressure: nearestAt(pressure.length ? pressure : pressure40ms, event.onset),
       leak: nearestAt(leak, event.onset),
     })),
+    segments,
+    gaps,
   };
 }
 
@@ -549,7 +670,34 @@ function buildOverviewRows(files) {
     signals: file.header.labels.filter((label) => label !== "Crc16").join(", "),
     samples: file.header.recordSampleCount,
     headerBytes: file.header.headerBytes,
+    crc: file.crc || null,
   }));
+}
+
+function crcOverview(files) {
+  return files.reduce(
+    (summary, file) => {
+      const internal = file.crc?.internal;
+      if (internal?.checked) {
+        summary.checked += internal.total;
+        summary.bad += internal.bad;
+      }
+      if (file.header.type !== "STR") {
+        if (file.crc?.sidecar?.present) summary.sidecars += 1;
+        else summary.missingSidecars += 1;
+      }
+      return summary;
+    },
+    { checked: 0, bad: 0, sidecars: 0, missingSidecars: 0 }
+  );
+}
+
+function crcStatusLabel(row) {
+  if (!row.crc?.internal?.checked) return "not checked";
+  const internal = row.crc.internal;
+  const recordStatus = internal.bad ? `${internal.bad}/${internal.total} bad` : `${internal.total}/${internal.total} ok`;
+  const sidecarStatus = row.crc.sidecar?.present ? "sidecar" : "no sidecar";
+  return `${recordStatus}, ${sidecarStatus}`;
 }
 
 function signalRecordValue(file, label, recordIndex) {
@@ -558,6 +706,15 @@ function signalRecordValue(file, label, recordIndex) {
   const samplesPerRecord = file.header.samplesPerRecord[file.header.labels.indexOf(label)] || 1;
   const point = signal[recordIndex * samplesPerRecord];
   return Number.isFinite(point?.value) ? point.value : null;
+}
+
+function signalRecordSamples(file, label, recordIndex) {
+  const signal = file?.signals?.[label];
+  const signalIndex = file?.header.labels.indexOf(label) ?? -1;
+  if (!signal?.length || signalIndex < 0) return [];
+  const samplesPerRecord = file.header.samplesPerRecord[signalIndex] || 1;
+  const start = recordIndex * samplesPerRecord;
+  return signal.slice(start, start + samplesPerRecord).map((point) => point.value);
 }
 
 function dateFromUnixDay(dayValue) {
@@ -578,6 +735,17 @@ function buildDailyRows(files) {
           ? new Date(file.header.startedAt.getTime() + record * file.header.recordDuration * 1000)
           : null);
         const leak95 = signalRecordValue(file, "Leak.95", record);
+        const maskOns = signalRecordSamples(file, "MaskOn", record);
+        const maskOffs = signalRecordSamples(file, "MaskOff", record);
+        const maskWindows = maskOns
+          .map((on, index) => {
+            const off = maskOffs[index];
+            if (!Number.isFinite(on) || !Number.isFinite(off) || (on === 0 && off === 0)) return null;
+            const normalizedOff = off < on ? off + 1440 : off;
+            if (normalizedOff <= on) return null;
+            return { on, off: normalizedOff, rawOff: off, minutes: normalizedOff - on };
+          })
+          .filter(Boolean);
         rows.push({
           date: isoDate(date) || `Record ${record + 1}`,
           usageMinutes: signalRecordValue(file, "OnDuration", record) ?? signalRecordValue(file, "Duration", record),
@@ -590,6 +758,7 @@ function buildDailyRows(files) {
           pressure95: signalRecordValue(file, "MaskPress.95", record) ?? signalRecordValue(file, "BlowPress.95", record),
           patientHours: signalRecordValue(file, "PatientHours", record),
           csrMinutes: signalRecordValue(file, "CSR", record),
+          maskWindows,
         });
       }
     });
@@ -609,6 +778,55 @@ function datalogGroupKey(file) {
   const dateMatch = file.fileName.match(/^(\d{8})_/);
   if (dateMatch) return dateMatch[1];
   return "Selected EDF files";
+}
+
+function fileStartMs(file) {
+  return file.header.startedAt?.getTime() || 0;
+}
+
+function fileDurationMs(file) {
+  const recordSpan = file.header.recordCount * file.header.recordDuration;
+  const annotationEnd = file.annotations?.length
+    ? Math.max(...file.annotations.map((event) => event.onset + event.duration))
+    : 0;
+  return Math.max(recordSpan, annotationEnd) * 1000;
+}
+
+function clockLabel(date) {
+  if (!date) return "--:--";
+  return `${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}`;
+}
+
+function buildSessionClusters(groupId, files) {
+  const sorted = files
+    .slice()
+    .sort((a, b) => fileStartMs(a) - fileStartMs(b) || a.relativePath.localeCompare(b.relativePath));
+  const clusters = [];
+  const gapMs = 10 * 60 * 1000;
+
+  sorted.forEach((file) => {
+    const startMs = fileStartMs(file);
+    const endMs = startMs + fileDurationMs(file);
+    const current = clusters[clusters.length - 1];
+    if (!current || (startMs && current.endMs && startMs > current.endMs + gapMs)) {
+      clusters.push({ files: [file], startMs, endMs: Math.max(endMs, startMs), typeCounts: {} });
+    } else {
+      current.files.push(file);
+      current.endMs = Math.max(current.endMs, endMs, startMs);
+    }
+    const target = clusters[clusters.length - 1];
+    target.typeCounts[file.header.type] = (target.typeCounts[file.header.type] || 0) + 1;
+  });
+
+  return clusters.map((cluster, index) => ({
+    id: `${groupId}#${index + 1}`,
+    label: `${clockLabel(cluster.startMs ? new Date(cluster.startMs) : null)}-${clockLabel(cluster.endMs ? new Date(cluster.endMs) : null)}`,
+    start: cluster.startMs ? new Date(cluster.startMs) : null,
+    end: cluster.endMs ? new Date(cluster.endMs) : null,
+    endSeconds: cluster.startMs && cluster.endMs ? (cluster.endMs - cluster.startMs) / 1000 : 0,
+    files: cluster.files,
+    typeCounts: cluster.typeCounts,
+  }));
 }
 
 function buildTherapyGroups(files) {
@@ -633,6 +851,7 @@ function buildTherapyGroups(files) {
         counts[file.header.type] = (counts[file.header.type] || 0) + 1;
         return counts;
       }, {});
+      const sessions = buildSessionClusters(id, sorted);
       return {
         id,
         label: id.replace(/^DATALOG\//, ""),
@@ -640,6 +859,7 @@ function buildTherapyGroups(files) {
         start,
         endSeconds,
         typeCounts,
+        sessions,
       };
     })
     .sort((a, b) => (a.start?.getTime() || 0) - (b.start?.getTime() || 0));
@@ -656,8 +876,7 @@ function UploadPanel({ onLoad, onLoadSample, error, loading }) {
   const [dragging, setDragging] = useState(false);
 
   async function handleFiles(fileList) {
-    const files = [...fileList].filter((file) => /\.edf$/i.test(file.name));
-    await onLoad(files);
+    await onLoad(fileEntriesFromList(fileList));
   }
 
   return (
@@ -698,7 +917,7 @@ function UploadPanel({ onLoad, onLoadSample, error, loading }) {
             Choose EDF files
             <input
               type="file"
-              accept=".edf"
+              accept=".edf,.crc"
               multiple
               onChange={(event) => handleFiles(event.target.files)}
             />
@@ -709,7 +928,7 @@ function UploadPanel({ onLoad, onLoadSample, error, loading }) {
           </button>
         </div>
         <div className="hint">
-          Expected sample set: <code>BRP</code>, <code>PLD</code>, <code>SAD</code>, <code>EVE</code>, <code>CSL</code>.
+          Expected sample set: <code>BRP</code>, <code>PLD</code>, <code>SAD</code>, <code>EVE</code>, <code>CSL</code>, plus optional <code>.crc</code> sidecars.
         </div>
         {loading ? <div className="status-line">Parsing EDF records...</div> : null}
         {error ? (
@@ -775,6 +994,7 @@ function TimelineChart({ session }) {
       ]),
     [session]
   );
+  const eventMarkers = session.events.slice(0, 80);
 
   return (
     <ResponsiveContainer width="100%" height={280}>
@@ -803,6 +1023,35 @@ function TimelineChart({ session }) {
           width={38}
         />
         <Tooltip content={<ChartTooltip />} />
+        {session.gaps.map((gap, index) => (
+          <ReferenceArea
+            key={`gap-${index}`}
+            x1={gap.startLabel}
+            x2={gap.endLabel}
+            fill={COLORS.coral}
+            fillOpacity={0.08}
+            yAxisId="left"
+          />
+        ))}
+        {session.segments.map((segment, index) => (
+          <ReferenceLine
+            key={`segment-${segment.type}-${index}`}
+            x={segment.startLabel}
+            yAxisId="left"
+            stroke={COLORS.faint}
+            strokeDasharray="3 4"
+            strokeOpacity={0.55}
+          />
+        ))}
+        {eventMarkers.map((event, index) => (
+          <ReferenceLine
+            key={`event-${event.onset}-${index}`}
+            x={event.time}
+            yAxisId="left"
+            stroke={/central/i.test(event.label) ? COLORS.amber : /obstructive/i.test(event.label) ? COLORS.coral : COLORS.blue}
+            strokeOpacity={0.28}
+          />
+        ))}
         <Line
           yAxisId="left"
           type="monotone"
@@ -838,9 +1087,19 @@ function TimelineChart({ session }) {
   );
 }
 
-function FlowChart({ session }) {
+function FlowChart({ session, canLoadFlow, flowLoading, onLoadFlow }) {
   const data = session.series.flow.map((point) => ({ ...point, flow: point.value }));
-  if (!data.length) return <EmptyState label="No BRP flow signal was loaded." />;
+  if (!data.length) {
+    return (
+      <EmptyState label={canLoadFlow ? "BRP waveform data is available but not loaded yet." : "No BRP flow signal was loaded."}>
+        {canLoadFlow ? (
+          <button type="button" className="secondary-button inline-action" onClick={onLoadFlow} disabled={flowLoading}>
+            {flowLoading ? "Loading flow..." : "Load BRP flow"}
+          </button>
+        ) : null}
+      </EmptyState>
+    );
+  }
 
   return (
     <ResponsiveContainer width="100%" height={240}>
@@ -966,30 +1225,118 @@ function EventsChart({ session }) {
 
 function EventTable({ events }) {
   if (!events.length) return <EmptyState label="No event annotations to show." />;
+  const rows = events.map((event) => ({
+    time: event.time,
+    label: event.label,
+    duration_seconds: round(event.duration, 0),
+    onset_seconds: round(event.onset, 0),
+    pressure_cmH2O: round(event.pressure, 2),
+    leak_L_min: round((event.leak || 0) * 60, 2),
+  }));
   return (
-    <div className="table-wrap compact-table">
-      <table>
-        <thead>
-          <tr>
-            <th>Time</th>
-            <th>Event</th>
-            <th>Duration</th>
-            <th>Pressure</th>
-            <th>Leak</th>
-          </tr>
-        </thead>
-        <tbody>
-          {events.map((event, index) => (
-            <tr key={`${event.onset}-${event.label}-${index}`}>
-              <td>{event.time}</td>
-              <td>{event.label}</td>
-              <td>{compact(event.duration, 0)}s</td>
-              <td>{compact(event.pressure, 1)} cmH2O</td>
-              <td>{compact((event.leak || 0) * 60, 1)} L/min</td>
+    <>
+      <ExportButtons baseName="cpap-events" rows={rows} />
+      <div className="table-wrap compact-table">
+        <table>
+          <thead>
+            <tr>
+              <th>Time</th>
+              <th>Event</th>
+              <th>Duration</th>
+              <th>Pressure</th>
+              <th>Leak</th>
             </tr>
-          ))}
-        </tbody>
-      </table>
+          </thead>
+          <tbody>
+            {events.map((event, index) => (
+              <tr key={`${event.onset}-${event.label}-${index}`}>
+                <td>{event.time}</td>
+                <td>{event.label}</td>
+                <td>{compact(event.duration, 0)}s</td>
+                <td>{compact(event.pressure, 1)} cmH2O</td>
+                <td>{compact((event.leak || 0) * 60, 1)} L/min</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </>
+  );
+}
+
+function downloadText(fileName, text, type) {
+  const blob = new Blob([text], { type });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = fileName;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  URL.revokeObjectURL(url);
+}
+
+function csvCell(value) {
+  if (value === null || value === undefined) return "";
+  const text = Array.isArray(value) ? value.join("; ") : String(value);
+  return /[",\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
+}
+
+function toCsv(rows) {
+  if (!rows.length) return "";
+  const headers = Object.keys(rows[0]);
+  return [headers.join(","), ...rows.map((row) => headers.map((header) => csvCell(row[header])).join(","))].join("\n");
+}
+
+function ExportButtons({ baseName, rows }) {
+  if (!rows.length) return null;
+  return (
+    <div className="export-actions">
+      <button type="button" className="secondary-button" onClick={() => downloadText(`${baseName}.csv`, toCsv(rows), "text/csv")}>
+        CSV
+      </button>
+      <button type="button" className="secondary-button" onClick={() => downloadText(`${baseName}.json`, JSON.stringify(rows, null, 2), "application/json")}>
+        JSON
+      </button>
+    </div>
+  );
+}
+
+function minuteOfDayLabel(minutes) {
+  if (!Number.isFinite(minutes)) return "--:--";
+  const wrapped = ((Math.round(minutes) % 1440) + 1440) % 1440;
+  const h = Math.floor(wrapped / 60);
+  const m = wrapped % 60;
+  return `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}`;
+}
+
+function maskWindowSummary(windows) {
+  if (!windows?.length) return "--";
+  return windows.map((window) => `${minuteOfDayLabel(window.on)}-${minuteOfDayLabel(window.rawOff)}`).join(", ");
+}
+
+function MaskTimeline({ rows }) {
+  const visibleRows = rows.filter((row) => row.maskWindows?.length);
+  if (!visibleRows.length) return null;
+  return (
+    <div className="mask-timeline">
+      {visibleRows.map((row) => (
+        <div className="mask-row" key={row.date}>
+          <span>{row.date}</span>
+          <div className="mask-track">
+            {row.maskWindows.map((window, index) => (
+              <i
+                key={`${row.date}-${index}`}
+                title={`${row.date} ${minuteOfDayLabel(window.on)}-${minuteOfDayLabel(window.rawOff)}`}
+                style={{
+                  left: `${Math.min(100, (window.on / 1440) * 100)}%`,
+                  width: `${Math.max(0.5, Math.min(100, (window.minutes / 1440) * 100))}%`,
+                }}
+              />
+            ))}
+          </div>
+        </div>
+      ))}
     </div>
   );
 }
@@ -1004,9 +1351,24 @@ function DailySummaryPanel({ rows }) {
     pressure95: row.pressure95,
     leak95LMin: row.leak95LMin,
   }));
+  const exportRows = rows.map((row) => ({
+    date: row.date,
+    usage_minutes: round(row.usageMinutes, 2),
+    mask_windows: maskWindowSummary(row.maskWindows),
+    ahi: round(row.ahi, 2),
+    hi: round(row.hi, 2),
+    ai: round(row.ai, 2),
+    cai: round(row.cai, 2),
+    oai: round(row.oai, 2),
+    leak_95_L_min: round(row.leak95LMin, 2),
+    pressure_95_cmH2O: round(row.pressure95, 2),
+    patient_hours: round(row.patientHours, 2),
+    csr_minutes: round(row.csrMinutes, 2),
+  }));
 
   return (
     <Panel title="Daily STR summary" note={`${rows.length} daily records`}>
+      <ExportButtons baseName="cpap-daily-summary" rows={exportRows} />
       <ResponsiveContainer width="100%" height={230}>
         <ComposedChart data={chartRows} margin={{ top: 8, right: 22, left: -8, bottom: 0 }}>
           <CartesianGrid stroke={COLORS.grid} vertical={false} />
@@ -1038,6 +1400,7 @@ function DailySummaryPanel({ rows }) {
           <Line yAxisId="left" type="monotone" dataKey="pressure95" name="Pressure 95%" stroke={COLORS.blue} strokeWidth={1.4} dot={false} />
         </ComposedChart>
       </ResponsiveContainer>
+      <MaskTimeline rows={rows} />
       <div className="table-wrap compact-table daily-table">
         <table>
           <thead>
@@ -1049,6 +1412,7 @@ function DailySummaryPanel({ rows }) {
               <th>OAI</th>
               <th>Leak 95</th>
               <th>Pressure 95</th>
+              <th>Mask windows</th>
               <th>CSR</th>
             </tr>
           </thead>
@@ -1062,6 +1426,7 @@ function DailySummaryPanel({ rows }) {
                 <td>{compact(row.oai, 2)}</td>
                 <td>{compact(row.leak95LMin, 1)} L/min</td>
                 <td>{compact(row.pressure95, 1)} cmH2O</td>
+                <td>{maskWindowSummary(row.maskWindows)}</td>
                 <td>{compact(row.csrMinutes, 0)}m</td>
               </tr>
             ))}
@@ -1084,6 +1449,7 @@ function FilesTable({ rows }) {
             <th>Records</th>
             <th>Record dur</th>
             <th>Samples/record</th>
+            <th>CRC</th>
             <th>Signals</th>
           </tr>
         </thead>
@@ -1096,6 +1462,7 @@ function FilesTable({ rows }) {
               <td>{row.records}</td>
               <td>{row.duration}s</td>
               <td>{row.samples}</td>
+              <td>{crcStatusLabel(row)}</td>
               <td>{row.signals}</td>
             </tr>
           ))}
@@ -1126,19 +1493,31 @@ function SignalHealth({ session }) {
   );
 }
 
-function EmptyState({ label }) {
+function EmptyState({ label, children }) {
   return (
     <div className="empty-state">
       <Info size={16} />
-      {label}
+      <span>{label}</span>
+      {children}
     </div>
   );
 }
 
-function ExportOverview({ parsed, groups, selectedGroupId, onSelectGroup, detailLoading, dailyRows }) {
+function ExportOverview({
+  parsed,
+  groups,
+  selectedNightId,
+  selectedSessionId,
+  onSelectNight,
+  onSelectSession,
+  detailLoading,
+  dailyRows,
+}) {
   const strLoaded = dailyRows.length > 0;
   const edfCount = parsed.length;
   const latestGroup = groups[groups.length - 1];
+  const selectedNight = groups.find((group) => group.id === selectedNightId) || latestGroup;
+  const crc = crcOverview(parsed);
 
   return (
     <Panel title="Export overview" note={strLoaded ? `${dailyRows.length} STR daily records` : "No STR summary loaded"}>
@@ -1155,19 +1534,38 @@ function ExportOverview({ parsed, groups, selectedGroupId, onSelectGroup, detail
           <span>Latest night</span>
           <strong>{latestGroup?.label || "--"}</strong>
         </div>
+        <div>
+          <span>CRC records</span>
+          <strong>{crc.bad ? `${crc.bad} bad` : `${crc.checked} ok`}</strong>
+        </div>
       </div>
       {groups.length ? (
-        <div className="night-picker">
-          <label htmlFor="night-select">Detailed night</label>
-          <select id="night-select" value={selectedGroupId} onChange={(event) => onSelectGroup(event.target.value)}>
-            {groups.map((group) => (
-              <option key={group.id} value={group.id}>
-                {group.label} · {group.files.length} EDFs · {durationLabel(group.endSeconds)}
-              </option>
+        <>
+          <div className="night-picker">
+            <label htmlFor="night-select">Detailed night</label>
+            <select id="night-select" value={selectedNight?.id || ""} onChange={(event) => onSelectNight(event.target.value)}>
+              {groups.map((group) => (
+                <option key={group.id} value={group.id}>
+                  {group.label} · {group.sessions.length} sessions · {group.files.length} EDFs
+                </option>
+              ))}
+            </select>
+            {detailLoading ? <span>Loading signal detail...</span> : null}
+          </div>
+          <div className="session-chips">
+            {(selectedNight?.sessions || []).map((session) => (
+              <button
+                type="button"
+                key={session.id}
+                className={session.id === selectedSessionId ? "is-active" : ""}
+                onClick={() => onSelectSession(session.id)}
+              >
+                <strong>{session.label}</strong>
+                <span>{durationLabel(session.endSeconds)} · {session.files.length} EDFs</span>
+              </button>
             ))}
-          </select>
-          {detailLoading ? <span>Loading signal detail...</span> : null}
-        </div>
+          </div>
+        </>
       ) : (
         <EmptyState label="No DATALOG therapy EDF files were found in this selection." />
       )}
@@ -1177,14 +1575,20 @@ function ExportOverview({ parsed, groups, selectedGroupId, onSelectGroup, detail
 
 function Dashboard({ parsed, onReset }) {
   const groups = useMemo(() => buildTherapyGroups(parsed), [parsed]);
-  const [selectedGroupId, setSelectedGroupId] = useState("");
+  const [selectedNightId, setSelectedNightId] = useState("");
+  const [selectedSessionId, setSelectedSessionId] = useState("");
   const [detailFiles, setDetailFiles] = useState([]);
   const [detailLoading, setDetailLoading] = useState(false);
-  const selectedGroup = useMemo(
-    () => groups.find((group) => group.id === selectedGroupId) || groups[groups.length - 1] || null,
-    [groups, selectedGroupId]
+  const [flowLoading, setFlowLoading] = useState(false);
+  const selectedNight = useMemo(
+    () => groups.find((group) => group.id === selectedNightId) || groups[groups.length - 1] || null,
+    [groups, selectedNightId]
   );
-  const activeFiles = detailFiles.length ? detailFiles : selectedGroup?.files || parsed;
+  const selectedSession = useMemo(
+    () => selectedNight?.sessions.find((session) => session.id === selectedSessionId) || selectedNight?.sessions[selectedNight.sessions.length - 1] || null,
+    [selectedNight, selectedSessionId]
+  );
+  const activeFiles = detailFiles.length ? detailFiles : selectedSession?.files || selectedNight?.files || parsed;
   const session = useMemo(() => buildSession(activeFiles), [activeFiles]);
   const rows = useMemo(() => buildOverviewRows(parsed), [parsed]);
   const dailyRows = useMemo(() => buildDailyRows(parsed), [parsed]);
@@ -1201,27 +1605,39 @@ function Dashboard({ parsed, onReset }) {
       ? session.stats.leak95 * 60
       : null;
   const flowRange = session.stats.flowMinMax;
+  const canLoadFlow = Boolean(selectedSession?.files.some((file) => file.header.type === "BRP")) && !session.series.flow.length;
 
   useEffect(() => {
     if (!groups.length) {
-      setSelectedGroupId("");
+      setSelectedNightId("");
+      setSelectedSessionId("");
       return;
     }
-    if (!selectedGroupId || !groups.some((group) => group.id === selectedGroupId)) {
-      setSelectedGroupId(groups[groups.length - 1].id);
+    if (!selectedNightId || !groups.some((group) => group.id === selectedNightId)) {
+      setSelectedNightId(groups[groups.length - 1].id);
     }
-  }, [groups, selectedGroupId]);
+  }, [groups, selectedNightId]);
+
+  useEffect(() => {
+    if (!selectedNight?.sessions.length) {
+      setSelectedSessionId("");
+      return;
+    }
+    if (!selectedSessionId || !selectedNight.sessions.some((session) => session.id === selectedSessionId)) {
+      setSelectedSessionId(selectedNight.sessions[selectedNight.sessions.length - 1].id);
+    }
+  }, [selectedNight, selectedSessionId]);
 
   useEffect(() => {
     let cancelled = false;
     async function hydrateSelectedGroup() {
-      if (!selectedGroup) {
+      if (!selectedSession) {
         setDetailFiles([]);
         return;
       }
       setDetailLoading(true);
       try {
-        const hydrated = await hydrateSignalFiles(selectedGroup.files);
+        const hydrated = await hydrateSignalFiles(selectedSession.files, "detail");
         if (!cancelled) setDetailFiles(hydrated);
       } finally {
         if (!cancelled) setDetailLoading(false);
@@ -1232,7 +1648,19 @@ function Dashboard({ parsed, onReset }) {
     return () => {
       cancelled = true;
     };
-  }, [selectedGroup]);
+  }, [selectedSession]);
+
+  async function handleLoadFlow() {
+    if (!selectedSession) return;
+    setFlowLoading(true);
+    try {
+      const baseFiles = detailFiles.length ? detailFiles : selectedSession.files;
+      const hydrated = await hydrateSignalFiles(baseFiles, "flow");
+      setDetailFiles(hydrated);
+    } finally {
+      setFlowLoading(false);
+    }
+  }
 
   return (
     <main className="screen">
@@ -1297,8 +1725,13 @@ function Dashboard({ parsed, onReset }) {
       <ExportOverview
         parsed={parsed}
         groups={groups}
-        selectedGroupId={selectedGroup?.id || ""}
-        onSelectGroup={setSelectedGroupId}
+        selectedNightId={selectedNight?.id || ""}
+        selectedSessionId={selectedSession?.id || ""}
+        onSelectNight={(id) => {
+          setSelectedNightId(id);
+          setSelectedSessionId("");
+        }}
+        onSelectSession={setSelectedSessionId}
         detailLoading={detailLoading}
         dailyRows={dailyRows}
       />
@@ -1329,7 +1762,7 @@ function Dashboard({ parsed, onReset }) {
 
       <div className="content-grid">
         <Panel title="Breath flow" note="BRP Flow.40ms">
-          <FlowChart session={session} />
+          <FlowChart session={session} canLoadFlow={canLoadFlow} flowLoading={flowLoading} onLoadFlow={handleLoadFlow} />
         </Panel>
         <Panel title="Oximetry" note="SAD SpO2.1s and Pulse.1s">
           <OximetryChart session={session} />
@@ -1364,11 +1797,21 @@ export default function CpapDashboard() {
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
 
-  async function parseFiles(files) {
-    const parsedFiles = [];
-    for (const file of files) {
-      parsedFiles.push(await parseEdfFile(file));
+  async function parseFiles(inputEntries) {
+    const entries = inputEntries[0]?.file ? inputEntries : fileEntriesFromList(inputEntries);
+    const edfEntries = entries.filter((entry) => /\.edf$/i.test(entry.name));
+    const sourceByPath = new Map(edfEntries.map((entry) => [entry.relativePath, entry.file]));
+    let parsedFiles = await requestWorkerFiles("parseFiles", entries, "summary");
+    if (!parsedFiles) {
+      parsedFiles = [];
+      for (const entry of edfEntries) {
+        parsedFiles.push(await parseEdfFile(entry, "summary"));
+      }
     }
+    parsedFiles = parsedFiles.map((file) => ({
+      ...file,
+      sourceFile: sourceByPath.get(file.relativePath),
+    }));
     parsedFiles.sort((a, b) => {
       const aTime = a.header.startedAt?.getTime() || 0;
       const bTime = b.header.startedAt?.getTime() || 0;
@@ -1377,15 +1820,15 @@ export default function CpapDashboard() {
     setParsed(parsedFiles);
   }
 
-  async function handleLoad(files) {
+  async function handleLoad(entries) {
     setError("");
-    if (!files.length) {
+    if (!entries.length || !entries.some((entry) => /\.edf$/i.test(entry.name))) {
       setError("No EDF files were selected.");
       return;
     }
     setLoading(true);
     try {
-      await parseFiles(files);
+      await parseFiles(entries);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to parse the selected EDF files.");
     } finally {
@@ -1397,19 +1840,20 @@ export default function CpapDashboard() {
     setError("");
     setLoading(true);
     try {
-      const files = await Promise.all(
+      const entries = await Promise.all(
         SAMPLE_EDF_PATHS.map(async (samplePath) => {
           const response = await fetch(samplePath);
           if (!response.ok) throw new Error(`Could not load ${samplePath}`);
           const buffer = await response.arrayBuffer();
+          const file = new File([buffer], samplePath.split("/").pop(), { type: "application/octet-stream" });
           return {
-            name: samplePath.split("/").pop(),
-            webkitRelativePath: samplePath.replace(/^\/sample-data\//, ""),
-            arrayBuffer: () => Promise.resolve(buffer),
+            file,
+            name: file.name,
+            relativePath: samplePath.replace(/^\/sample-data\//, ""),
           };
         })
       );
-      await parseFiles(files);
+      await parseFiles(entries);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to load the bundled sample EDF files.");
     } finally {
@@ -1702,7 +2146,7 @@ code {
 
 .overview-grid {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: 8px;
 }
 
@@ -1750,6 +2194,104 @@ code {
   border: 1px solid ${COLORS.border2};
   border-radius: 8px;
   font: 13px Inter, sans-serif;
+}
+
+.session-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.session-chips button {
+  display: grid;
+  gap: 3px;
+  min-width: 132px;
+  padding: 9px 11px;
+  text-align: left;
+  color: ${COLORS.text};
+  background: ${COLORS.panel2};
+  border: 1px solid ${COLORS.border};
+  border-radius: 8px;
+  cursor: pointer;
+}
+
+.session-chips button.is-active {
+  border-color: ${COLORS.teal};
+  box-shadow: inset 0 0 0 1px rgba(78, 205, 196, 0.28);
+}
+
+.session-chips strong {
+  font-family: "SFMono-Regular", Consolas, monospace;
+  font-size: 13px;
+}
+
+.session-chips span {
+  color: ${COLORS.muted};
+  font-size: 11px;
+}
+
+.export-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin: -2px 0 10px;
+}
+
+.export-actions .secondary-button {
+  height: 30px;
+  padding: 0 10px;
+  font-size: 11px;
+}
+
+.inline-action {
+  height: 32px;
+  margin-left: 4px;
+  padding: 0 10px;
+  font-size: 12px;
+}
+
+.mask-timeline {
+  display: grid;
+  gap: 7px;
+  margin: 8px 0 12px;
+  padding: 11px;
+  background: ${COLORS.panel2};
+  border: 1px solid ${COLORS.border};
+  border-radius: 8px;
+  max-height: 210px;
+  overflow: auto;
+}
+
+.mask-row {
+  display: grid;
+  grid-template-columns: 88px minmax(220px, 1fr);
+  align-items: center;
+  gap: 10px;
+}
+
+.mask-row span {
+  color: ${COLORS.muted};
+  font-family: "SFMono-Regular", Consolas, monospace;
+  font-size: 11px;
+}
+
+.mask-track {
+  position: relative;
+  height: 12px;
+  background: #0d1425;
+  border: 1px solid ${COLORS.border};
+  border-radius: 999px;
+  overflow: hidden;
+}
+
+.mask-track i {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  display: block;
+  background: ${COLORS.teal};
+  border-radius: 999px;
 }
 
 .event-counts div,
@@ -1805,6 +2347,7 @@ code {
   min-height: 120px;
   align-items: center;
   justify-content: center;
+  flex-wrap: wrap;
   background: ${COLORS.panel2};
   border-color: ${COLORS.border};
 }
@@ -1886,7 +2429,8 @@ td:last-child {
   .signal-health,
   .event-counts,
   .overview-grid,
-  .night-picker {
+  .night-picker,
+  .mask-row {
     grid-template-columns: 1fr;
   }
 
