@@ -26,6 +26,7 @@ import {
   XAxis,
   YAxis,
 } from "recharts";
+import { parseEdfEntry } from "./edfParser.js";
 
 const COLORS = {
   bg: "#0b1020",
@@ -44,7 +45,6 @@ const COLORS = {
   grid: "#27324b",
 };
 
-const INVALID_DIGITAL = new Set([-32768, 32767]);
 const KNOWN_TYPES = ["STR", "BRP", "PLD", "SAD", "EVE", "CSL"];
 const SAMPLE_EDF_PATHS = [
   "/sample-data/20260712/20260713_005314_CSL.crc",
@@ -163,34 +163,16 @@ async function putCachedSummaries(entries, files) {
   db.close();
 }
 
-function ascii(view, start, length) {
-  let out = "";
-  for (let i = start; i < start + length && i < view.byteLength; i += 1) {
-    const code = view.getUint8(i);
-    out += code >= 32 && code <= 126 ? String.fromCharCode(code) : " ";
-  }
-  return out.trim();
-}
-
-function latin1(view, start, length) {
-  let out = "";
-  for (let i = start; i < start + length && i < view.byteLength; i += 1) {
-    out += String.fromCharCode(view.getUint8(i));
-  }
-  return out;
-}
-
-function numberField(text, fallback = null) {
-  const n = Number(String(text).trim());
-  return Number.isFinite(n) ? n : fallback;
-}
-
-function parseStartDate(dateText, timeText) {
-  const [day, month, year] = dateText.split(".").map((part) => Number(part));
-  const [hour, minute, second] = timeText.split(".").map((part) => Number(part));
-  if (!day || !month || year === undefined) return null;
-  const fullYear = year < 85 ? 2000 + year : 1900 + year;
-  return new Date(fullYear, month - 1, day, hour || 0, minute || 0, second || 0);
+async function clearParseCache() {
+  const db = await openParseCache();
+  if (!db) return;
+  await new Promise((resolve) => {
+    const tx = db.transaction("summary", "readwrite");
+    tx.objectStore("summary").clear();
+    tx.oncomplete = resolve;
+    tx.onerror = resolve;
+  });
+  db.close();
 }
 
 function isoDate(date) {
@@ -271,200 +253,13 @@ function minMax(values) {
   return { min, max };
 }
 
-function fileKind(name) {
-  if (/^STR\.edf$/i.test(name)) return "STR";
-  const match = name.match(/_([A-Z]{3})\.edf$/i);
-  return match ? match[1].toUpperCase() : "EDF";
-}
-
-function parseEdfHeader(buffer, fileName) {
-  const view = new DataView(buffer);
-  const signalCount = numberField(ascii(view, 252, 4), 0);
-  let offset = 256;
-  const readFields = (width, mapper = (x) => x) => {
-    const values = [];
-    for (let i = 0; i < signalCount; i += 1) {
-      values.push(mapper(ascii(view, offset + i * width, width)));
-    }
-    offset += signalCount * width;
-    return values;
-  };
-
-  const labels = readFields(16);
-  const transducers = readFields(80);
-  const dimensions = readFields(8);
-  const physicalMin = readFields(8, (v) => numberField(v, 0));
-  const physicalMax = readFields(8, (v) => numberField(v, 0));
-  const digitalMin = readFields(8, (v) => numberField(v, 0));
-  const digitalMax = readFields(8, (v) => numberField(v, 0));
-  const prefilters = readFields(80);
-  const samplesPerRecord = readFields(8, (v) => numberField(v, 0));
-  const reservedSignals = readFields(32);
-  const headerBytes = numberField(ascii(view, 184, 8), offset);
-  const recordCount = numberField(ascii(view, 236, 8), 0);
-  const recordDuration = numberField(ascii(view, 244, 8), 0);
-  const startDate = ascii(view, 168, 8);
-  const startTime = ascii(view, 176, 8);
-
-  return {
-    fileName,
-    type: fileKind(fileName),
-    version: ascii(view, 0, 8),
-    patient: ascii(view, 8, 80),
-    recording: ascii(view, 88, 80),
-    startDate,
-    startTime,
-    startedAt: parseStartDate(startDate, startTime),
-    headerBytes,
-    reserved: ascii(view, 192, 44),
-    recordCount,
-    recordDuration,
-    signalCount,
-    labels,
-    transducers,
-    dimensions,
-    physicalMin,
-    physicalMax,
-    digitalMin,
-    digitalMax,
-    prefilters,
-    samplesPerRecord,
-    reservedSignals,
-    recordSampleCount: samplesPerRecord.reduce((sum, value) => sum + value, 0),
-  };
-}
-
-function digitalToPhysical(digital, header, signalIndex) {
-  const dMin = header.digitalMin[signalIndex];
-  const dMax = header.digitalMax[signalIndex];
-  const pMin = header.physicalMin[signalIndex];
-  const pMax = header.physicalMax[signalIndex];
-  if (dMax === dMin) return digital;
-  return ((digital - dMin) * (pMax - pMin)) / (dMax - dMin) + pMin;
-}
-
-function parseSignalSeries(buffer, header, signalIndex, intervalSeconds) {
-  const view = new DataView(buffer);
-  const values = [];
-  const samplesBeforeSignal = header.samplesPerRecord
-    .slice(0, signalIndex)
-    .reduce((sum, value) => sum + value, 0);
-  const bytesPerRecord = header.recordSampleCount * 2;
-  const signalSamples = header.samplesPerRecord[signalIndex];
-  const sampleStep = intervalSeconds || (signalSamples ? header.recordDuration / signalSamples : 0);
-
-  for (let record = 0; record < header.recordCount; record += 1) {
-    const recordOffset = header.headerBytes + record * bytesPerRecord;
-    const signalOffset = recordOffset + samplesBeforeSignal * 2;
-    for (let sample = 0; sample < signalSamples; sample += 1) {
-      const byteOffset = signalOffset + sample * 2;
-      if (byteOffset + 2 > view.byteLength) break;
-      const digital = view.getInt16(byteOffset, true);
-      const outsideRange = digital < header.digitalMin[signalIndex] || digital > header.digitalMax[signalIndex];
-      const value = INVALID_DIGITAL.has(digital) || outsideRange ? null : digitalToPhysical(digital, header, signalIndex);
-      values.push({
-        t: record * header.recordDuration + sample * sampleStep,
-        value,
-        digital,
-      });
-    }
-  }
-  return values;
-}
-
-function parseAllSignals(buffer, header) {
-  const signals = {};
-  header.labels.forEach((label, index) => {
-    if (label === "Crc16" || label === "EDF Annotations") return;
-    signals[label] = parseSignalSeries(buffer, header, index);
-  });
-  return signals;
-}
-
-function signalLabelsForMode(header, mode) {
-  if (mode === "summary") return header.type === "STR" ? header.labels : [];
-  if (mode === "detail") return header.type === "PLD" || header.type === "SAD" ? header.labels : [];
-  if (mode === "flow") return header.type === "BRP" ? ["Flow.40ms", "Press.40ms"] : [];
-  if (mode === "all") return header.labels;
-  return [];
-}
-
-function parseSignalsForMode(buffer, header, mode) {
-  const labels = new Set(signalLabelsForMode(header, mode));
-  const signals = {};
-  header.labels.forEach((label, index) => {
-    if (label === "Crc16" || label === "EDF Annotations" || !labels.has(label)) return;
-    signals[label] = parseSignalSeries(buffer, header, index);
-  });
-  return signals;
-}
-
-function parseAnnotationText(text) {
-  const events = [];
-  const chunks = text.split("\u0000").filter(Boolean);
-  chunks.forEach((chunk) => {
-    const match = chunk.match(/^([+-]?\d+(?:\.\d+)?)(?:\u0015(\d+(?:\.\d+)?))?\u0014([\s\S]*)$/);
-    if (!match) return;
-    const onset = Number(match[1]);
-    const duration = match[2] === undefined ? 0 : Number(match[2]);
-    const labels = match[3]
-      .split("\u0014")
-      .map((value) => value.trim())
-      .filter(Boolean);
-    labels.forEach((label) => {
-      if (label !== "Recording starts") {
-        events.push({ onset, duration, label });
-      }
-    });
-  });
-  return events;
-}
-
-function parseAnnotations(buffer, header) {
-  const view = new DataView(buffer);
-  const annIndex = header.labels.findIndex((label) => label === "EDF Annotations");
-  if (annIndex < 0) return [];
-
-  const samplesBeforeSignal = header.samplesPerRecord
-    .slice(0, annIndex)
-    .reduce((sum, value) => sum + value, 0);
-  const bytesPerRecord = header.recordSampleCount * 2;
-  const events = [];
-  for (let record = 0; record < header.recordCount; record += 1) {
-    const offset = header.headerBytes + record * bytesPerRecord + samplesBeforeSignal * 2;
-    const length = header.samplesPerRecord[annIndex] * 2;
-    const text = latin1(view, offset, length);
-    events.push(...parseAnnotationText(text));
-  }
-  return events.sort((a, b) => a.onset - b.onset);
-}
-
-async function readFileBuffer(file) {
-  if (typeof file.arrayBuffer === "function") return file.arrayBuffer();
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => resolve(reader.result);
-    reader.onerror = reject;
-    reader.readAsArrayBuffer(file);
-  });
-}
-
 async function parseEdfFile(input, mode = "summary") {
   const file = input.file || input;
   const relativePath = input.relativePath || file.webkitRelativePath || file.name;
-  const buffer = await readFileBuffer(file);
-  const header = parseEdfHeader(buffer, file.name || relativePath || "unknown.edf");
-  const annotations = header.labels.includes("EDF Annotations") ? parseAnnotations(buffer, header) : [];
-  const signals = parseSignalsForMode(buffer, header, mode);
+  const parsed = await parseEdfEntry({ file, name: file.name || relativePath, relativePath }, mode);
   return {
-    fileName: file.name,
-    relativePath,
+    ...parsed,
     sourceFile: file,
-    header,
-    annotations,
-    signals,
-    signalsLoaded: mode === "all" || (mode === "summary" && header.type === "STR") || (mode === "detail" && (header.type === "PLD" || header.type === "SAD")) || (mode === "flow" && header.type === "BRP") || header.labels.includes("EDF Annotations"),
-    flowLoaded: mode === "flow" && header.type === "BRP",
   };
 }
 
@@ -473,11 +268,10 @@ async function hydrateSignals(fileRecord, mode = "detail") {
   if (fileRecord.header.labels.includes("EDF Annotations")) {
     return { ...fileRecord, signalsLoaded: true };
   }
-  const buffer = await readFileBuffer(fileRecord.sourceFile);
-  const signals = parseSignalsForMode(buffer, fileRecord.header, mode);
+  const parsed = await parseEdfFile({ file: fileRecord.sourceFile, relativePath: fileRecord.relativePath }, mode);
   return {
     ...fileRecord,
-    signals: { ...fileRecord.signals, ...signals },
+    signals: { ...fileRecord.signals, ...parsed.signals },
     signalsLoaded: mode === "detail" ? true : fileRecord.signalsLoaded,
     flowLoaded: mode === "flow" ? true : fileRecord.flowLoaded,
   };
@@ -710,6 +504,10 @@ function buildSession(files) {
       snore: sampleEvery(snore),
       spo2: sampleEvery(spo2),
       pulse: sampleEvery(pulse),
+    },
+    rawSeries: {
+      flow,
+      pressure40ms,
     },
     events: events.map((event) => ({
       ...event,
@@ -961,7 +759,7 @@ function statusForSignal(series) {
   return `${valid.length.toLocaleString()} samples`;
 }
 
-function UploadPanel({ onLoad, onLoadSample, onCancel, error, loading, progress }) {
+function UploadPanel({ onLoad, onLoadSample, onCancel, onClearCache, error, loading, progress, cacheStats }) {
   const [dragging, setDragging] = useState(false);
 
   async function handleFiles(fileList) {
@@ -1018,6 +816,12 @@ function UploadPanel({ onLoad, onLoadSample, onCancel, error, loading, progress 
         </div>
         <div className="hint">
           Expected sample set: <code>BRP</code>, <code>PLD</code>, <code>SAD</code>, <code>EVE</code>, <code>CSL</code>, plus optional <code>.crc</code> sidecars.
+        </div>
+        <div className="cache-actions">
+          <span>{cacheStats?.hits ? `${cacheStats.hits} cached summaries used` : "Parser cache ready"}</span>
+          <button type="button" className="secondary-button inline-action" onClick={onClearCache} disabled={loading}>
+            Clear parser cache
+          </button>
         </div>
         {loading ? (
           <div className="status-line progress-line">
@@ -1316,7 +1120,7 @@ function OximetryChart({ session }) {
   );
 }
 
-function EventDetailPanel({ event, session, onClear, prefs }) {
+function EventDetailPanel({ event, session, onClear, prefs, canLoadFlow, flowLoading, onLoadFlow }) {
   if (!event) return <EmptyState label="Select an event row to inspect a focused pressure/leak window." />;
   const start = Math.max(0, event.onset - 60);
   const end = event.onset + Math.max(60, event.duration + 60);
@@ -1324,7 +1128,8 @@ function EventDetailPanel({ event, session, onClear, prefs }) {
   const leak = session.series.leak
     .filter((point) => point.time >= start && point.time <= end)
     .map((point) => ({ ...point, value: leakFromLps(point.value, prefs) }));
-  const flow = session.series.flow.filter((point) => point.time >= start && point.time <= end);
+  const rawFlow = (session.rawSeries?.flow || []).filter((point) => point.t >= start && point.t <= end);
+  const flow = rawFlow.map((point) => ({ time: point.t, label: timeLabel(point.t), value: round(point.value, 3), flow: point.value }));
   const chartData = mergeSeries(pressure, [
     { key: "pressure", series: pressure },
     { key: "leakDisplay", series: leak },
@@ -1352,6 +1157,17 @@ function EventDetailPanel({ event, session, onClear, prefs }) {
           <Line type="monotone" dataKey="flow" name="Flow L/s" stroke={COLORS.blue} strokeWidth={1.2} dot={false} connectNulls />
         </ComposedChart>
       </ResponsiveContainer>
+      {flow.length ? (
+        <div className="event-waveform">
+          <CanvasWaveform data={flow} />
+        </div>
+      ) : canLoadFlow ? (
+        <EmptyState label="Raw BRP waveform is available for this event but not loaded.">
+          <button type="button" className="secondary-button inline-action" onClick={onLoadFlow} disabled={flowLoading}>
+            {flowLoading ? "Loading flow..." : "Load raw event flow"}
+          </button>
+        </EmptyState>
+      ) : null}
     </div>
   );
 }
@@ -1413,34 +1229,20 @@ function EventTable({ events, selectedEvent, onSelectEvent, prefs }) {
   return (
     <>
       <ExportButtons baseName="cpap-events" rows={rows} />
-      <div className="table-wrap compact-table">
-        <table>
-          <thead>
-            <tr>
-              <th>Time</th>
-              <th>Event</th>
-              <th>Duration</th>
-              <th>Pressure</th>
-              <th>Leak</th>
-            </tr>
-          </thead>
-          <tbody>
-            {events.map((event, index) => (
-              <tr
-                key={`${event.onset}-${event.label}-${index}`}
-                className={selectedEvent?.onset === event.onset && selectedEvent?.label === event.label ? "selected-row" : ""}
-                onClick={() => onSelectEvent?.(event)}
-              >
-                <td>{event.time}</td>
-                <td>{event.label}</td>
-                <td>{compact(event.duration, 0)}s</td>
-                <td>{compact(event.pressure, 1)} cmH2O</td>
-                <td>{compact(leakFromLps(event.leak || 0, prefs), 1)} {leakUnitLabel(prefs)}</td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
+      <VirtualTable
+        rows={events}
+        maxHeight={260}
+        rowKey={(event, index) => `${event.onset}-${event.label}-${index}`}
+        rowClassName={(event) => selectedEvent?.onset === event.onset && selectedEvent?.label === event.label ? "selected-row" : ""}
+        onRowClick={onSelectEvent}
+        columns={[
+          { key: "time", header: "Time" },
+          { key: "label", header: "Event" },
+          { key: "duration", header: "Duration", render: (event) => `${compact(event.duration, 0)}s` },
+          { key: "pressure", header: "Pressure", render: (event) => `${compact(event.pressure, 1)} cmH2O` },
+          { key: "leak", header: "Leak", render: (event) => `${compact(leakFromLps(event.leak || 0, prefs), 1)} ${leakUnitLabel(prefs)}` },
+        ]}
+      />
     </>
   );
 }
@@ -1479,6 +1281,51 @@ function ExportButtons({ baseName, rows }) {
       <button type="button" className="secondary-button" onClick={() => downloadText(`${baseName}.json`, JSON.stringify(rows, null, 2), "application/json")}>
         JSON
       </button>
+    </div>
+  );
+}
+
+function VirtualTable({ columns, rows, rowKey, rowClassName, onRowClick, maxHeight = 320 }) {
+  const [scrollTop, setScrollTop] = useState(0);
+  const rowHeight = 36;
+  const overscan = 8;
+  const visibleCount = Math.ceil(maxHeight / rowHeight) + overscan * 2;
+  const startIndex = Math.max(0, Math.floor(scrollTop / rowHeight) - overscan);
+  const endIndex = Math.min(rows.length, startIndex + visibleCount);
+  const topPad = startIndex * rowHeight;
+  const bottomPad = Math.max(0, (rows.length - endIndex) * rowHeight);
+  const visibleRows = rows.slice(startIndex, endIndex);
+
+  return (
+    <div className="table-wrap" style={{ maxHeight }} onScroll={(event) => setScrollTop(event.currentTarget.scrollTop)}>
+      <table>
+        <thead>
+          <tr>
+            {columns.map((column) => <th key={column.key}>{column.header}</th>)}
+          </tr>
+        </thead>
+        <tbody>
+          {topPad ? (
+            <tr aria-hidden="true">
+              <td colSpan={columns.length} style={{ height: topPad, padding: 0, border: 0 }} />
+            </tr>
+          ) : null}
+          {visibleRows.map((row, index) => (
+            <tr
+              key={rowKey(row, startIndex + index)}
+              className={rowClassName?.(row) || ""}
+              onClick={() => onRowClick?.(row)}
+            >
+              {columns.map((column) => <td key={column.key}>{column.render ? column.render(row) : row[column.key]}</td>)}
+            </tr>
+          ))}
+          {bottomPad ? (
+            <tr aria-hidden="true">
+              <td colSpan={columns.length} style={{ height: bottomPad, padding: 0, border: 0 }} />
+            </tr>
+          ) : null}
+        </tbody>
+      </table>
     </div>
   );
 }
@@ -1582,74 +1429,43 @@ function DailySummaryPanel({ rows, prefs }) {
         </ComposedChart>
       </ResponsiveContainer>
       <MaskTimeline rows={rows} />
-      <div className="table-wrap compact-table daily-table">
-        <table>
-          <thead>
-            <tr>
-              <th>Date</th>
-              <th>Usage</th>
-              <th>AHI</th>
-              <th>CAI</th>
-              <th>OAI</th>
-              <th>Leak 95</th>
-              <th>Pressure 95</th>
-              <th>Mask windows</th>
-              <th>CSR</th>
-            </tr>
-          </thead>
-          <tbody>
-            {rows.map((row) => (
-              <tr key={row.date}>
-                <td>{row.date}</td>
-                <td>{Number.isFinite(row.usageMinutes) ? durationLabel(row.usageMinutes * 60) : "--"}</td>
-                <td>{compact(row.ahi, 2)}</td>
-                <td>{compact(row.cai, 2)}</td>
-                <td>{compact(row.oai, 2)}</td>
-                <td>{compact(leakFromLmin(row.leak95LMin, prefs), 1)} {leakUnitLabel(prefs)}</td>
-                <td>{compact(row.pressure95, 1)} cmH2O</td>
-                <td>{maskWindowSummary(row.maskWindows)}</td>
-                <td>{compact(row.csrMinutes, 0)}m</td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
+      <VirtualTable
+        rows={rows}
+        maxHeight={260}
+        rowKey={(row) => row.date}
+        columns={[
+          { key: "date", header: "Date" },
+          { key: "usage", header: "Usage", render: (row) => Number.isFinite(row.usageMinutes) ? durationLabel(row.usageMinutes * 60) : "--" },
+          { key: "ahi", header: "AHI", render: (row) => compact(row.ahi, 2) },
+          { key: "cai", header: "CAI", render: (row) => compact(row.cai, 2) },
+          { key: "oai", header: "OAI", render: (row) => compact(row.oai, 2) },
+          { key: "leak", header: "Leak 95", render: (row) => `${compact(leakFromLmin(row.leak95LMin, prefs), 1)} ${leakUnitLabel(prefs)}` },
+          { key: "pressure", header: "Pressure 95", render: (row) => `${compact(row.pressure95, 1)} cmH2O` },
+          { key: "mask", header: "Mask windows", render: (row) => maskWindowSummary(row.maskWindows) },
+          { key: "csr", header: "CSR", render: (row) => `${compact(row.csrMinutes, 0)}m` },
+        ]}
+      />
     </Panel>
   );
 }
 
 function FilesTable({ rows }) {
   return (
-    <div className="table-wrap">
-      <table>
-        <thead>
-          <tr>
-            <th>File</th>
-            <th>Type</th>
-            <th>Start</th>
-            <th>Records</th>
-            <th>Record dur</th>
-            <th>Samples/record</th>
-            <th>CRC</th>
-            <th>Signals</th>
-          </tr>
-        </thead>
-        <tbody>
-          {rows.map((row) => (
-            <tr key={row.name}>
-              <td>{row.name}</td>
-              <td>{row.type}</td>
-              <td>{row.start}</td>
-              <td>{row.records}</td>
-              <td>{row.duration}s</td>
-              <td>{row.samples}</td>
-              <td>{crcStatusLabel(row)}</td>
-              <td>{row.signals}</td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
-    </div>
+    <VirtualTable
+      rows={rows}
+      maxHeight={360}
+      rowKey={(row) => row.name}
+      columns={[
+        { key: "name", header: "File" },
+        { key: "type", header: "Type" },
+        { key: "start", header: "Start" },
+        { key: "records", header: "Records" },
+        { key: "duration", header: "Record dur", render: (row) => `${row.duration}s` },
+        { key: "samples", header: "Samples/record" },
+        { key: "crc", header: "CRC", render: crcStatusLabel },
+        { key: "signals", header: "Signals" },
+      ]}
+    />
   );
 }
 
@@ -1702,6 +1518,17 @@ function PreferencesPanel({ prefs, onChange }) {
             <option value={2}>2 decimals</option>
           </select>
         </label>
+      </div>
+    </Panel>
+  );
+}
+
+function CrcNotePanel() {
+  return (
+    <Panel title="CRC validation" note="record-level strict checks">
+      <div className="note-box">
+        <ListChecks size={16} />
+        Internal EDF record CRCs are validated with CRC-CCITT-FALSE. The 8-byte ResMed .crc sidecars are tracked for presence and inspection; strict sidecar validation still needs the vendor sidecar algorithm.
       </div>
     </Panel>
   );
@@ -1958,6 +1785,7 @@ function Dashboard({ parsed, onReset }) {
       />
 
       <PreferencesPanel prefs={prefs} onChange={setPrefs} />
+      <CrcNotePanel />
 
       <div className="content-grid">
         <Panel title="Therapy timeline" note="pressure, leak, respiratory rate">
@@ -1997,7 +1825,15 @@ function Dashboard({ parsed, onReset }) {
           <EventTable events={session.events} selectedEvent={selectedEvent} onSelectEvent={setSelectedEvent} prefs={prefs} />
         </Panel>
         <Panel title="Event focus" note="±60 seconds where available">
-          <EventDetailPanel event={selectedEvent} session={session} prefs={prefs} onClear={() => setSelectedEvent(null)} />
+          <EventDetailPanel
+            event={selectedEvent}
+            session={session}
+            prefs={prefs}
+            canLoadFlow={canLoadFlow}
+            flowLoading={flowLoading}
+            onLoadFlow={handleLoadFlow}
+            onClear={() => setSelectedEvent(null)}
+          />
         </Panel>
       </div>
 
@@ -2026,6 +1862,7 @@ export default function CpapDashboard() {
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
   const [progress, setProgress] = useState(null);
+  const [cacheStats, setCacheStats] = useState({ hits: 0, misses: 0 });
   const parseAbortRef = useRef(null);
 
   async function parseFiles(inputEntries) {
@@ -2035,6 +1872,7 @@ export default function CpapDashboard() {
     const crcEntries = entries.filter((entry) => /\.crc$/i.test(entry.name));
     const crcByPath = new Map(crcEntries.map((entry) => [entry.relativePath, entry]));
     const { cached, missing } = await getCachedSummaries(edfEntries);
+    setCacheStats({ hits: cached.size, misses: missing.length });
     let parsedFiles = [...cached.values()];
     setProgress({ done: cached.size, total: edfEntries.length, fileName: cached.size ? "cache" : "" });
 
@@ -2108,6 +1946,11 @@ export default function CpapDashboard() {
     parseAbortRef.current?.abort();
   }
 
+  async function handleClearCache() {
+    await clearParseCache();
+    setCacheStats({ hits: 0, misses: 0 });
+  }
+
   async function handleLoadSample() {
     setError("");
     setLoading(true);
@@ -2147,9 +1990,11 @@ export default function CpapDashboard() {
           onLoad={handleLoad}
           onLoadSample={handleLoadSample}
           onCancel={handleCancel}
+          onClearCache={handleClearCache}
           error={error}
           loading={loading}
           progress={progress}
+          cacheStats={cacheStats}
         />
       )}
     </div>
@@ -2267,6 +2112,17 @@ input[type="file"] {
   margin-top: 18px;
   font-size: 12px;
   color: ${COLORS.faint};
+}
+
+.cache-actions {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  margin-top: 12px;
+  color: ${COLORS.faint};
+  font-size: 12px;
+  flex-wrap: wrap;
 }
 
 .progress-line {
@@ -2622,6 +2478,10 @@ code {
 
 .canvas-wrap canvas {
   display: block;
+}
+
+.event-waveform {
+  margin-top: 10px;
 }
 
 .event-counts div,
