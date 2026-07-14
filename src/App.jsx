@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import {
   Activity,
   AlertCircle,
@@ -70,7 +70,7 @@ function getEdfWorker() {
   return edfWorker;
 }
 
-function requestWorkerFiles(type, entries, mode) {
+function requestWorkerFiles(type, entries, mode, options = {}) {
   const worker = getEdfWorker();
   if (!worker) return null;
   const id = workerRequestId + 1;
@@ -79,11 +79,20 @@ function requestWorkerFiles(type, entries, mode) {
   return new Promise((resolve, reject) => {
     const handleMessage = (event) => {
       if (event.data?.id !== id) return;
+      if (event.data.progress) {
+        options.onProgress?.(event.data);
+        return;
+      }
       worker.removeEventListener("message", handleMessage);
+      options.signal?.removeEventListener("abort", handleAbort);
       if (event.data.ok) resolve(event.data.files);
-      else reject(new Error(event.data.error || "EDF worker failed"));
+      else reject(new Error(event.data.cancelled ? "Parsing cancelled" : event.data.error || "EDF worker failed"));
+    };
+    const handleAbort = () => {
+      worker.postMessage({ id, type: "cancel" });
     };
     worker.addEventListener("message", handleMessage);
+    options.signal?.addEventListener("abort", handleAbort, { once: true });
     worker.postMessage({ id, type, entries, mode });
   });
 }
@@ -100,6 +109,58 @@ function fileEntriesFromList(fileList) {
   return [...fileList]
     .filter((file) => /\.(edf|crc)$/i.test(file.name))
     .map(toFileEntry);
+}
+
+function cacheKey(entry) {
+  return `${entry.relativePath}|${entry.file.size || 0}|${entry.file.lastModified || 0}`;
+}
+
+function openParseCache() {
+  if (!("indexedDB" in window)) return Promise.resolve(null);
+  return new Promise((resolve) => {
+    const request = indexedDB.open("cpap-edf-cache", 1);
+    request.onupgradeneeded = () => request.result.createObjectStore("summary");
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => resolve(null);
+  });
+}
+
+async function getCachedSummaries(entries) {
+  const db = await openParseCache();
+  if (!db) return { cached: new Map(), missing: entries };
+  const cached = new Map();
+  const missing = [];
+  await Promise.all(entries.map((entry) => new Promise((resolve) => {
+    const request = db.transaction("summary", "readonly").objectStore("summary").get(cacheKey(entry));
+    request.onsuccess = () => {
+      if (request.result) cached.set(entry.relativePath, request.result);
+      else missing.push(entry);
+      resolve();
+    };
+    request.onerror = () => {
+      missing.push(entry);
+      resolve();
+    };
+  })));
+  db.close();
+  return { cached, missing };
+}
+
+async function putCachedSummaries(entries, files) {
+  const db = await openParseCache();
+  if (!db) return;
+  const entryByPath = new Map(entries.map((entry) => [entry.relativePath, entry]));
+  await new Promise((resolve) => {
+    const tx = db.transaction("summary", "readwrite");
+    const store = tx.objectStore("summary");
+    files.forEach((file) => {
+      const entry = entryByPath.get(file.relativePath);
+      if (entry) store.put(file, cacheKey(entry));
+    });
+    tx.oncomplete = resolve;
+    tx.onerror = resolve;
+  });
+  db.close();
 }
 
 function ascii(view, start, length) {
@@ -166,6 +227,20 @@ function round(value, digits = 1) {
 function compact(value, digits = 1) {
   const rounded = round(value, digits);
   return rounded === null ? "--" : String(rounded);
+}
+
+function leakUnitLabel(prefs) {
+  return prefs.leakUnit === "lps" ? "L/s" : "L/min";
+}
+
+function leakFromLps(value, prefs) {
+  if (!Number.isFinite(value)) return null;
+  return prefs.leakUnit === "lps" ? value : value * 60;
+}
+
+function leakFromLmin(value, prefs) {
+  if (!Number.isFinite(value)) return null;
+  return prefs.leakUnit === "lps" ? value / 60 : value;
 }
 
 function mean(values) {
@@ -797,7 +872,17 @@ function clockLabel(date) {
   return `${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}`;
 }
 
-function buildSessionClusters(groupId, files) {
+function findMaskWindowForCluster(cluster, dailyRows) {
+  if (!cluster.startMs) return null;
+  const start = new Date(cluster.startMs);
+  const date = isoDate(start);
+  const minute = start.getHours() * 60 + start.getMinutes();
+  const row = dailyRows.find((item) => item.date === date);
+  const window = row?.maskWindows?.find((item) => minute >= item.on && minute <= item.off);
+  return window ? `${minuteOfDayLabel(window.on)}-${minuteOfDayLabel(window.rawOff)}` : null;
+}
+
+function buildSessionClusters(groupId, files, dailyRows = []) {
   const sorted = files
     .slice()
     .sort((a, b) => fileStartMs(a) - fileStartMs(b) || a.relativePath.localeCompare(b.relativePath));
@@ -818,18 +903,22 @@ function buildSessionClusters(groupId, files) {
     target.typeCounts[file.header.type] = (target.typeCounts[file.header.type] || 0) + 1;
   });
 
-  return clusters.map((cluster, index) => ({
-    id: `${groupId}#${index + 1}`,
-    label: `${clockLabel(cluster.startMs ? new Date(cluster.startMs) : null)}-${clockLabel(cluster.endMs ? new Date(cluster.endMs) : null)}`,
-    start: cluster.startMs ? new Date(cluster.startMs) : null,
-    end: cluster.endMs ? new Date(cluster.endMs) : null,
-    endSeconds: cluster.startMs && cluster.endMs ? (cluster.endMs - cluster.startMs) / 1000 : 0,
-    files: cluster.files,
-    typeCounts: cluster.typeCounts,
-  }));
+  return clusters.map((cluster, index) => {
+    const maskWindow = findMaskWindowForCluster(cluster, dailyRows);
+    return {
+      id: `${groupId}#${index + 1}`,
+      label: `${clockLabel(cluster.startMs ? new Date(cluster.startMs) : null)}-${clockLabel(cluster.endMs ? new Date(cluster.endMs) : null)}`,
+      maskWindow,
+      start: cluster.startMs ? new Date(cluster.startMs) : null,
+      end: cluster.endMs ? new Date(cluster.endMs) : null,
+      endSeconds: cluster.startMs && cluster.endMs ? (cluster.endMs - cluster.startMs) / 1000 : 0,
+      files: cluster.files,
+      typeCounts: cluster.typeCounts,
+    };
+  });
 }
 
-function buildTherapyGroups(files) {
+function buildTherapyGroups(files, dailyRows = []) {
   const therapyFiles = files.filter((file) => ["BRP", "PLD", "SAD", "EVE", "CSL"].includes(file.header.type));
   const map = new Map();
   therapyFiles.forEach((file) => {
@@ -851,7 +940,7 @@ function buildTherapyGroups(files) {
         counts[file.header.type] = (counts[file.header.type] || 0) + 1;
         return counts;
       }, {});
-      const sessions = buildSessionClusters(id, sorted);
+      const sessions = buildSessionClusters(id, sorted, dailyRows);
       return {
         id,
         label: id.replace(/^DATALOG\//, ""),
@@ -872,7 +961,7 @@ function statusForSignal(series) {
   return `${valid.length.toLocaleString()} samples`;
 }
 
-function UploadPanel({ onLoad, onLoadSample, error, loading }) {
+function UploadPanel({ onLoad, onLoadSample, onCancel, error, loading, progress }) {
   const [dragging, setDragging] = useState(false);
 
   async function handleFiles(fileList) {
@@ -930,7 +1019,18 @@ function UploadPanel({ onLoad, onLoadSample, error, loading }) {
         <div className="hint">
           Expected sample set: <code>BRP</code>, <code>PLD</code>, <code>SAD</code>, <code>EVE</code>, <code>CSL</code>, plus optional <code>.crc</code> sidecars.
         </div>
-        {loading ? <div className="status-line">Parsing EDF records...</div> : null}
+        {loading ? (
+          <div className="status-line progress-line">
+            <span>
+              {progress?.total
+                ? `Parsing ${progress.done} / ${progress.total}${progress.fileName ? ` · ${progress.fileName}` : ""}`
+                : "Preparing EDF records..."}
+            </span>
+            <button type="button" className="secondary-button inline-action" onClick={onCancel}>
+              Cancel
+            </button>
+          </div>
+        ) : null}
         {error ? (
           <div className="error-line">
             <AlertCircle size={15} />
@@ -984,15 +1084,15 @@ function ChartTooltip({ active, payload, label }) {
   );
 }
 
-function TimelineChart({ session }) {
+function TimelineChart({ session, prefs }) {
   const chartData = useMemo(
     () =>
       mergeSeries(session.series.pressure, [
         { key: "pressure", series: session.series.pressure },
-        { key: "leakLMin", series: session.series.leak.map((point) => ({ ...point, value: point.value * 60 })) },
+        { key: "leakDisplay", series: session.series.leak.map((point) => ({ ...point, value: leakFromLps(point.value, prefs) })) },
         { key: "respiration", series: session.series.respiration },
       ]),
-    [session]
+    [session, prefs]
   );
   const eventMarkers = session.events.slice(0, 80);
 
@@ -1065,8 +1165,8 @@ function TimelineChart({ session }) {
         <Line
           yAxisId="left"
           type="monotone"
-          dataKey="leakLMin"
-          name="Leak L/min"
+          dataKey="leakDisplay"
+          name={`Leak ${leakUnitLabel(prefs)}`}
           stroke={COLORS.teal}
           strokeWidth={1.8}
           dot={false}
@@ -1101,35 +1201,72 @@ function FlowChart({ session, canLoadFlow, flowLoading, onLoadFlow }) {
     );
   }
 
+  return <CanvasWaveform data={data} />;
+}
+
+function CanvasWaveform({ data }) {
+  const canvasRef = useRef(null);
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas || !data.length) return;
+    const parent = canvas.parentElement;
+    const width = parent?.clientWidth || 800;
+    const height = 240;
+    const ratio = window.devicePixelRatio || 1;
+    canvas.width = width * ratio;
+    canvas.height = height * ratio;
+    canvas.style.width = `${width}px`;
+    canvas.style.height = `${height}px`;
+
+    const ctx = canvas.getContext("2d");
+    ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
+    ctx.clearRect(0, 0, width, height);
+    ctx.fillStyle = "#0d1425";
+    ctx.fillRect(0, 0, width, height);
+
+    const values = data.map((point) => point.flow).filter(Number.isFinite);
+    const min = Math.min(...values);
+    const max = Math.max(...values);
+    const pad = 22;
+    const range = Math.max(0.1, max - min);
+    const xFor = (index) => pad + (index / Math.max(1, data.length - 1)) * (width - pad * 2);
+    const yFor = (value) => height - pad - ((value - min) / range) * (height - pad * 2);
+
+    ctx.strokeStyle = COLORS.grid;
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    for (let i = 0; i < 5; i += 1) {
+      const y = pad + (i / 4) * (height - pad * 2);
+      ctx.moveTo(pad, y);
+      ctx.lineTo(width - pad, y);
+    }
+    ctx.stroke();
+
+    ctx.strokeStyle = COLORS.teal;
+    ctx.lineWidth = 1.4;
+    ctx.beginPath();
+    data.forEach((point, index) => {
+      const x = xFor(index);
+      const y = yFor(point.flow);
+      if (index === 0) ctx.moveTo(x, y);
+      else ctx.lineTo(x, y);
+    });
+    ctx.stroke();
+
+    ctx.fillStyle = COLORS.muted;
+    ctx.font = "11px SFMono-Regular, Consolas, monospace";
+    ctx.fillText(`${compact(max, 2)} L/s`, 6, pad);
+    ctx.fillText(`${compact(min, 2)} L/s`, 6, height - 8);
+    ctx.fillText(data[0]?.label || "00:00:00", pad, height - 6);
+    ctx.textAlign = "right";
+    ctx.fillText(data[data.length - 1]?.label || "", width - pad, height - 6);
+  }, [data]);
+
   return (
-    <ResponsiveContainer width="100%" height={240}>
-      <ComposedChart data={data} margin={{ top: 8, right: 16, left: -8, bottom: 0 }}>
-        <CartesianGrid stroke={COLORS.grid} vertical={false} />
-        <XAxis
-          dataKey="label"
-          minTickGap={38}
-          tick={{ fill: COLORS.faint, fontSize: 11 }}
-          axisLine={{ stroke: COLORS.border }}
-          tickLine={false}
-        />
-        <YAxis
-          tick={{ fill: COLORS.faint, fontSize: 11 }}
-          axisLine={false}
-          tickLine={false}
-          width={38}
-        />
-        <Tooltip content={<ChartTooltip />} />
-        <Line
-          type="monotone"
-          dataKey="flow"
-          name="Flow L/s"
-          stroke={COLORS.teal}
-          strokeWidth={1.4}
-          dot={false}
-          connectNulls
-        />
-      </ComposedChart>
-    </ResponsiveContainer>
+    <div className="canvas-wrap">
+      <canvas ref={canvasRef} aria-label="Flow waveform" />
+    </div>
   );
 }
 
@@ -1179,6 +1316,46 @@ function OximetryChart({ session }) {
   );
 }
 
+function EventDetailPanel({ event, session, onClear, prefs }) {
+  if (!event) return <EmptyState label="Select an event row to inspect a focused pressure/leak window." />;
+  const start = Math.max(0, event.onset - 60);
+  const end = event.onset + Math.max(60, event.duration + 60);
+  const pressure = session.series.pressure.filter((point) => point.time >= start && point.time <= end);
+  const leak = session.series.leak
+    .filter((point) => point.time >= start && point.time <= end)
+    .map((point) => ({ ...point, value: leakFromLps(point.value, prefs) }));
+  const flow = session.series.flow.filter((point) => point.time >= start && point.time <= end);
+  const chartData = mergeSeries(pressure, [
+    { key: "pressure", series: pressure },
+    { key: "leakDisplay", series: leak },
+    { key: "flow", series: flow },
+  ]);
+
+  return (
+    <div>
+      <div className="event-detail-head">
+        <div>
+          <strong>{event.label}</strong>
+          <span>{event.time} · {compact(event.duration, 0)}s</span>
+        </div>
+        <button type="button" className="secondary-button inline-action" onClick={onClear}>Clear</button>
+      </div>
+      <ResponsiveContainer width="100%" height={210}>
+        <ComposedChart data={chartData} margin={{ top: 8, right: 18, left: -8, bottom: 0 }}>
+          <CartesianGrid stroke={COLORS.grid} vertical={false} />
+          <XAxis dataKey="label" minTickGap={34} tick={{ fill: COLORS.faint, fontSize: 11 }} axisLine={{ stroke: COLORS.border }} tickLine={false} />
+          <YAxis tick={{ fill: COLORS.faint, fontSize: 11 }} axisLine={false} tickLine={false} width={38} />
+          <Tooltip content={<ChartTooltip />} />
+          <ReferenceLine x={event.time} stroke={COLORS.amber} strokeDasharray="4 3" />
+          <Line type="monotone" dataKey="pressure" name="Pressure cmH2O" stroke={COLORS.amber} strokeWidth={2} dot={false} connectNulls />
+          <Line type="monotone" dataKey="leakDisplay" name={`Leak ${leakUnitLabel(prefs)}`} stroke={COLORS.teal} strokeWidth={1.6} dot={false} connectNulls />
+          <Line type="monotone" dataKey="flow" name="Flow L/s" stroke={COLORS.blue} strokeWidth={1.2} dot={false} connectNulls />
+        </ComposedChart>
+      </ResponsiveContainer>
+    </div>
+  );
+}
+
 function EventsChart({ session }) {
   const data = session.events.map((event) => ({
     ...event,
@@ -1223,7 +1400,7 @@ function EventsChart({ session }) {
   );
 }
 
-function EventTable({ events }) {
+function EventTable({ events, selectedEvent, onSelectEvent, prefs }) {
   if (!events.length) return <EmptyState label="No event annotations to show." />;
   const rows = events.map((event) => ({
     time: event.time,
@@ -1231,7 +1408,7 @@ function EventTable({ events }) {
     duration_seconds: round(event.duration, 0),
     onset_seconds: round(event.onset, 0),
     pressure_cmH2O: round(event.pressure, 2),
-    leak_L_min: round((event.leak || 0) * 60, 2),
+    [`leak_${leakUnitLabel(prefs).replace("/", "_")}`]: round(leakFromLps(event.leak || 0, prefs), 2),
   }));
   return (
     <>
@@ -1249,12 +1426,16 @@ function EventTable({ events }) {
           </thead>
           <tbody>
             {events.map((event, index) => (
-              <tr key={`${event.onset}-${event.label}-${index}`}>
+              <tr
+                key={`${event.onset}-${event.label}-${index}`}
+                className={selectedEvent?.onset === event.onset && selectedEvent?.label === event.label ? "selected-row" : ""}
+                onClick={() => onSelectEvent?.(event)}
+              >
                 <td>{event.time}</td>
                 <td>{event.label}</td>
                 <td>{compact(event.duration, 0)}s</td>
                 <td>{compact(event.pressure, 1)} cmH2O</td>
-                <td>{compact((event.leak || 0) * 60, 1)} L/min</td>
+                <td>{compact(leakFromLps(event.leak || 0, prefs), 1)} {leakUnitLabel(prefs)}</td>
               </tr>
             ))}
           </tbody>
@@ -1341,7 +1522,7 @@ function MaskTimeline({ rows }) {
   );
 }
 
-function DailySummaryPanel({ rows }) {
+function DailySummaryPanel({ rows, prefs }) {
   if (!rows.length) return null;
   const chartRows = rows.map((row) => ({
     date: row.date,
@@ -1349,7 +1530,7 @@ function DailySummaryPanel({ rows }) {
     usageHours: Number.isFinite(row.usageMinutes) ? round(row.usageMinutes / 60, 2) : null,
     ahi: row.ahi,
     pressure95: row.pressure95,
-    leak95LMin: row.leak95LMin,
+    leakDisplay: leakFromLmin(row.leak95LMin, prefs),
   }));
   const exportRows = rows.map((row) => ({
     date: row.date,
@@ -1360,7 +1541,7 @@ function DailySummaryPanel({ rows }) {
     ai: round(row.ai, 2),
     cai: round(row.cai, 2),
     oai: round(row.oai, 2),
-    leak_95_L_min: round(row.leak95LMin, 2),
+    [`leak_95_${leakUnitLabel(prefs).replace("/", "_")}`]: round(leakFromLmin(row.leak95LMin, prefs), 2),
     pressure_95_cmH2O: round(row.pressure95, 2),
     patient_hours: round(row.patientHours, 2),
     csr_minutes: round(row.csrMinutes, 2),
@@ -1424,7 +1605,7 @@ function DailySummaryPanel({ rows }) {
                 <td>{compact(row.ahi, 2)}</td>
                 <td>{compact(row.cai, 2)}</td>
                 <td>{compact(row.oai, 2)}</td>
-                <td>{compact(row.leak95LMin, 1)} L/min</td>
+                <td>{compact(leakFromLmin(row.leak95LMin, prefs), 1)} {leakUnitLabel(prefs)}</td>
                 <td>{compact(row.pressure95, 1)} cmH2O</td>
                 <td>{maskWindowSummary(row.maskWindows)}</td>
                 <td>{compact(row.csrMinutes, 0)}m</td>
@@ -1503,6 +1684,29 @@ function EmptyState({ label, children }) {
   );
 }
 
+function PreferencesPanel({ prefs, onChange }) {
+  return (
+    <Panel title="Preferences" note="stored in this browser">
+      <div className="preferences-grid">
+        <label>
+          <span>Leak unit</span>
+          <select value={prefs.leakUnit} onChange={(event) => onChange({ ...prefs, leakUnit: event.target.value })}>
+            <option value="lmin">L/min</option>
+            <option value="lps">L/s</option>
+          </select>
+        </label>
+        <label>
+          <span>Pressure decimals</span>
+          <select value={prefs.pressureDigits} onChange={(event) => onChange({ ...prefs, pressureDigits: Number(event.target.value) })}>
+            <option value={1}>1 decimal</option>
+            <option value={2}>2 decimals</option>
+          </select>
+        </label>
+      </div>
+    </Panel>
+  );
+}
+
 function ExportOverview({
   parsed,
   groups,
@@ -1561,7 +1765,10 @@ function ExportOverview({
                 onClick={() => onSelectSession(session.id)}
               >
                 <strong>{session.label}</strong>
-                <span>{durationLabel(session.endSeconds)} · {session.files.length} EDFs</span>
+                <span>
+                  {durationLabel(session.endSeconds)} · {session.files.length} EDFs
+                  {session.maskWindow ? ` · STR ${session.maskWindow}` : ""}
+                </span>
               </button>
             ))}
           </div>
@@ -1574,12 +1781,21 @@ function ExportOverview({
 }
 
 function Dashboard({ parsed, onReset }) {
-  const groups = useMemo(() => buildTherapyGroups(parsed), [parsed]);
+  const dailyRows = useMemo(() => buildDailyRows(parsed), [parsed]);
+  const groups = useMemo(() => buildTherapyGroups(parsed, dailyRows), [parsed, dailyRows]);
   const [selectedNightId, setSelectedNightId] = useState("");
   const [selectedSessionId, setSelectedSessionId] = useState("");
   const [detailFiles, setDetailFiles] = useState([]);
   const [detailLoading, setDetailLoading] = useState(false);
   const [flowLoading, setFlowLoading] = useState(false);
+  const [selectedEvent, setSelectedEvent] = useState(null);
+  const [prefs, setPrefs] = useState(() => {
+    try {
+      return { leakUnit: "lmin", pressureDigits: 1, ...JSON.parse(localStorage.getItem("cpap-prefs") || "{}") };
+    } catch {
+      return { leakUnit: "lmin", pressureDigits: 1 };
+    }
+  });
   const selectedNight = useMemo(
     () => groups.find((group) => group.id === selectedNightId) || groups[groups.length - 1] || null,
     [groups, selectedNightId]
@@ -1591,7 +1807,6 @@ function Dashboard({ parsed, onReset }) {
   const activeFiles = detailFiles.length ? detailFiles : selectedSession?.files || selectedNight?.files || parsed;
   const session = useMemo(() => buildSession(activeFiles), [activeFiles]);
   const rows = useMemo(() => buildOverviewRows(parsed), [parsed]);
-  const dailyRows = useMemo(() => buildDailyRows(parsed), [parsed]);
   const sessionDate = session.date || "Unknown date";
   const summaryOnly = dailyRows.length > 0 && session.therapySeconds === 0;
   const avgDailyUsageHours = mean(dailyRows.map((row) => (Number.isFinite(row.usageMinutes) ? row.usageMinutes / 60 : null)));
@@ -1604,8 +1819,13 @@ function Dashboard({ parsed, onReset }) {
     : Number.isFinite(session.stats.leak95)
       ? session.stats.leak95 * 60
       : null;
+  const leak95Display = summaryOnly ? leakFromLmin(leak95LMin, prefs) : leakFromLps(session.stats.leak95, prefs);
   const flowRange = session.stats.flowMinMax;
   const canLoadFlow = Boolean(selectedSession?.files.some((file) => file.header.type === "BRP")) && !session.series.flow.length;
+
+  useEffect(() => {
+    localStorage.setItem("cpap-prefs", JSON.stringify(prefs));
+  }, [prefs]);
 
   useEffect(() => {
     if (!groups.length) {
@@ -1644,6 +1864,7 @@ function Dashboard({ parsed, onReset }) {
       }
     }
     setDetailFiles([]);
+    setSelectedEvent(null);
     hydrateSelectedGroup();
     return () => {
       cancelled = true;
@@ -1701,17 +1922,17 @@ function Dashboard({ parsed, onReset }) {
         <StatCard
           icon={Gauge}
           label="Pressure 95%"
-          value={compact(summaryOnly ? avgDailyPressure95 : session.stats.pressure95, 1)}
+          value={compact(summaryOnly ? avgDailyPressure95 : session.stats.pressure95, prefs.pressureDigits)}
           unit="cmH2O"
-          sub={summaryOnly ? "daily average" : `median ${compact(session.stats.pressureMedian, 1)} cmH2O`}
+          sub={summaryOnly ? "daily average" : `median ${compact(session.stats.pressureMedian, prefs.pressureDigits)} cmH2O`}
           tone="amber"
         />
         <StatCard
           icon={Droplets}
           label="Leak 95%"
-          value={compact(leak95LMin, 1)}
-          unit="L/min"
-          sub={summaryOnly ? "daily average" : `median ${compact((session.stats.leakMedian || 0) * 60, 1)} L/min`}
+          value={compact(leak95Display, 1)}
+          unit={leakUnitLabel(prefs)}
+          sub={summaryOnly ? "daily average" : `median ${compact(leakFromLps(session.stats.leakMedian, prefs), 1)} ${leakUnitLabel(prefs)}`}
         />
         <StatCard
           icon={Wind}
@@ -1736,9 +1957,11 @@ function Dashboard({ parsed, onReset }) {
         dailyRows={dailyRows}
       />
 
+      <PreferencesPanel prefs={prefs} onChange={setPrefs} />
+
       <div className="content-grid">
         <Panel title="Therapy timeline" note="pressure, leak, respiratory rate">
-          <TimelineChart session={session} />
+          <TimelineChart session={session} prefs={prefs} />
         </Panel>
 
         <Panel title="Event summary" note="from EDF+ annotations" className="side-panel">
@@ -1771,8 +1994,14 @@ function Dashboard({ parsed, onReset }) {
 
       <div className="content-grid">
         <Panel title="Events" note="pressure/leak sampled near event onset">
-          <EventTable events={session.events} />
+          <EventTable events={session.events} selectedEvent={selectedEvent} onSelectEvent={setSelectedEvent} prefs={prefs} />
         </Panel>
+        <Panel title="Event focus" note="±60 seconds where available">
+          <EventDetailPanel event={selectedEvent} session={session} prefs={prefs} onClear={() => setSelectedEvent(null)} />
+        </Panel>
+      </div>
+
+      <div className="content-grid">
         <Panel title="Signal health" note="valid parsed samples">
           <SignalHealth session={session} />
           <div className="note-box">
@@ -1783,7 +2012,7 @@ function Dashboard({ parsed, onReset }) {
         </Panel>
       </div>
 
-      <DailySummaryPanel rows={dailyRows} />
+      <DailySummaryPanel rows={dailyRows} prefs={prefs} />
 
       <Panel title="Loaded EDF files" note="header-derived structure">
         <FilesTable rows={rows} />
@@ -1796,21 +2025,56 @@ export default function CpapDashboard() {
   const [parsed, setParsed] = useState([]);
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
+  const [progress, setProgress] = useState(null);
+  const parseAbortRef = useRef(null);
 
   async function parseFiles(inputEntries) {
     const entries = inputEntries[0]?.file ? inputEntries : fileEntriesFromList(inputEntries);
     const edfEntries = entries.filter((entry) => /\.edf$/i.test(entry.name));
     const sourceByPath = new Map(edfEntries.map((entry) => [entry.relativePath, entry.file]));
-    let parsedFiles = await requestWorkerFiles("parseFiles", entries, "summary");
-    if (!parsedFiles) {
-      parsedFiles = [];
-      for (const entry of edfEntries) {
-        parsedFiles.push(await parseEdfFile(entry, "summary"));
+    const crcEntries = entries.filter((entry) => /\.crc$/i.test(entry.name));
+    const crcByPath = new Map(crcEntries.map((entry) => [entry.relativePath, entry]));
+    const { cached, missing } = await getCachedSummaries(edfEntries);
+    let parsedFiles = [...cached.values()];
+    setProgress({ done: cached.size, total: edfEntries.length, fileName: cached.size ? "cache" : "" });
+
+    if (missing.length) {
+      const workerEntries = [...missing, ...crcEntries];
+      const parsedMissing = await requestWorkerFiles("parseFiles", workerEntries, "summary", {
+        signal: parseAbortRef.current?.signal,
+        onProgress: (event) => {
+          setProgress({
+            done: cached.size + event.done,
+            total: edfEntries.length,
+            fileName: event.fileName,
+          });
+        },
+      });
+      if (parsedMissing) {
+        parsedFiles = [...parsedFiles, ...parsedMissing];
+        await putCachedSummaries(missing, parsedMissing);
+      } else {
+        for (let index = 0; index < missing.length; index += 1) {
+          if (parseAbortRef.current?.signal.aborted) throw new Error("Parsing cancelled");
+          parsedFiles.push(await parseEdfFile(missing[index], "summary"));
+          setProgress({ done: cached.size + index + 1, total: edfEntries.length, fileName: missing[index].relativePath });
+        }
       }
     }
+
     parsedFiles = parsedFiles.map((file) => ({
       ...file,
       sourceFile: sourceByPath.get(file.relativePath),
+      crc: {
+        ...file.crc,
+        sidecar: crcByPath.has(file.relativePath.replace(/\.edf$/i, ".crc"))
+          ? {
+              present: true,
+              bytes: crcByPath.get(file.relativePath.replace(/\.edf$/i, ".crc")).file.size || 0,
+              hex: file.crc?.sidecar?.hex || "",
+            }
+          : file.crc?.sidecar || { present: false, bytes: 0, hex: "" },
+      },
     }));
     parsedFiles.sort((a, b) => {
       const aTime = a.header.startedAt?.getTime() || 0;
@@ -1827,18 +2091,28 @@ export default function CpapDashboard() {
       return;
     }
     setLoading(true);
+    setProgress(null);
+    parseAbortRef.current = new AbortController();
     try {
       await parseFiles(entries);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to parse the selected EDF files.");
     } finally {
+      parseAbortRef.current = null;
+      setProgress(null);
       setLoading(false);
     }
+  }
+
+  function handleCancel() {
+    parseAbortRef.current?.abort();
   }
 
   async function handleLoadSample() {
     setError("");
     setLoading(true);
+    setProgress(null);
+    parseAbortRef.current = new AbortController();
     try {
       const entries = await Promise.all(
         SAMPLE_EDF_PATHS.map(async (samplePath) => {
@@ -1857,6 +2131,8 @@ export default function CpapDashboard() {
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to load the bundled sample EDF files.");
     } finally {
+      parseAbortRef.current = null;
+      setProgress(null);
       setLoading(false);
     }
   }
@@ -1867,7 +2143,14 @@ export default function CpapDashboard() {
       {parsed.length ? (
         <Dashboard parsed={parsed} onReset={() => setParsed([])} />
       ) : (
-        <UploadPanel onLoad={handleLoad} onLoadSample={handleLoadSample} error={error} loading={loading} />
+        <UploadPanel
+          onLoad={handleLoad}
+          onLoadSample={handleLoadSample}
+          onCancel={handleCancel}
+          error={error}
+          loading={loading}
+          progress={progress}
+        />
       )}
     </div>
   );
@@ -1984,6 +2267,14 @@ input[type="file"] {
   margin-top: 18px;
   font-size: 12px;
   color: ${COLORS.faint};
+}
+
+.progress-line {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  flex-wrap: wrap;
 }
 
 code {
@@ -2231,6 +2522,32 @@ code {
   font-size: 11px;
 }
 
+.preferences-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.preferences-grid label {
+  display: grid;
+  gap: 6px;
+  color: ${COLORS.muted};
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.preferences-grid select {
+  height: 36px;
+  padding: 0 10px;
+  color: ${COLORS.text};
+  background: #0d1425;
+  border: 1px solid ${COLORS.border2};
+  border-radius: 8px;
+  font: 13px Inter, sans-serif;
+}
+
 .export-actions {
   display: flex;
   justify-content: flex-end;
@@ -2292,6 +2609,19 @@ code {
   display: block;
   background: ${COLORS.teal};
   border-radius: 999px;
+}
+
+.canvas-wrap {
+  width: 100%;
+  min-height: 240px;
+  overflow: hidden;
+  border: 1px solid ${COLORS.border};
+  border-radius: 8px;
+  background: #0d1425;
+}
+
+.canvas-wrap canvas {
+  display: block;
 }
 
 .event-counts div,
@@ -2398,6 +2728,40 @@ td:last-child {
   font-family: Inter, sans-serif;
 }
 
+tr.selected-row td {
+  background: rgba(78, 205, 196, 0.08);
+  color: ${COLORS.text};
+}
+
+tbody tr {
+  cursor: default;
+}
+
+.event-detail-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 8px;
+}
+
+.event-detail-head strong,
+.event-detail-head span {
+  display: block;
+}
+
+.event-detail-head strong {
+  color: ${COLORS.text};
+  font-size: 13px;
+}
+
+.event-detail-head span {
+  margin-top: 3px;
+  color: ${COLORS.muted};
+  font-family: "SFMono-Regular", Consolas, monospace;
+  font-size: 12px;
+}
+
 @media (max-width: 980px) {
   .stats-grid,
   .content-grid {
@@ -2430,7 +2794,8 @@ td:last-child {
   .event-counts,
   .overview-grid,
   .night-picker,
-  .mask-row {
+  .mask-row,
+  .preferences-grid {
     grid-template-columns: 1fr;
   }
 
