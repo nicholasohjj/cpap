@@ -26,7 +26,7 @@ import {
   XAxis,
   YAxis,
 } from "recharts";
-import { parseEdfEntry } from "./edfParser.js";
+import { civilClockLabel, civilDateLabel, epochMsToCivil, parseEdfEntry } from "./edfParser.js";
 
 const COLORS = {
   bg: "#0b1020",
@@ -46,6 +46,29 @@ const COLORS = {
 };
 
 const KNOWN_TYPES = ["STR", "BRP", "PLD", "SAD", "EVE", "CSL"];
+const PARSE_CACHE_VERSION = "v3";
+const EMPTY_DIAGNOSTICS = {
+  totalInput: 0,
+  supportedInput: 0,
+  skipped: 0,
+  edf: 0,
+  crcFiles: 0,
+  parsed: 0,
+  failed: 0,
+  failures: [],
+  skippedFiles: [],
+  cacheHits: 0,
+  cacheMisses: 0,
+  parseMs: null,
+  crc: {
+    validating: false,
+    checkedRecords: 0,
+    badRecords: 0,
+    pendingFiles: 0,
+    sidecars: 0,
+    missingSidecars: 0,
+  },
+};
 const SAMPLE_EDF_PATHS = [
   "/sample-data/20260712/20260713_005314_CSL.crc",
   "/sample-data/20260712/20260713_005314_CSL.edf",
@@ -85,7 +108,13 @@ function requestWorkerFiles(type, entries, mode, options = {}) {
       }
       worker.removeEventListener("message", handleMessage);
       options.signal?.removeEventListener("abort", handleAbort);
-      if (event.data.ok) resolve(event.data.files);
+      if (event.data.ok) {
+        resolve({
+          files: event.data.files || [],
+          failures: event.data.failures || [],
+          results: event.data.results || [],
+        });
+      }
       else reject(new Error(event.data.cancelled ? "Parsing cancelled" : event.data.error || "EDF worker failed"));
     };
     const handleAbort = () => {
@@ -107,12 +136,11 @@ function toFileEntry(file) {
 
 function fileEntriesFromList(fileList) {
   return [...fileList]
-    .filter((file) => /\.(edf|crc)$/i.test(file.name))
     .map(toFileEntry);
 }
 
 function cacheKey(entry) {
-  return `${entry.relativePath}|${entry.file.size || 0}|${entry.file.lastModified || 0}`;
+  return `${PARSE_CACHE_VERSION}|${entry.relativePath}|${entry.file.size || 0}|${entry.file.lastModified || 0}`;
 }
 
 function openParseCache() {
@@ -177,10 +205,18 @@ async function clearParseCache() {
 
 function isoDate(date) {
   if (!date) return "";
-  const y = date.getFullYear();
-  const m = String(date.getMonth() + 1).padStart(2, "0");
-  const d = String(date.getDate()).padStart(2, "0");
+  if (date.year) return civilDateLabel(date);
+  const y = date.getUTCFullYear();
+  const m = String(date.getUTCMonth() + 1).padStart(2, "0");
+  const d = String(date.getUTCDate()).padStart(2, "0");
   return `${y}-${m}-${d}`;
+}
+
+function civilToSortMs(value) {
+  if (!value) return 0;
+  if (Number.isFinite(value)) return value;
+  if (value.year) return Date.UTC(value.year, value.month - 1, value.day, value.hour || 0, value.minute || 0, value.second || 0);
+  return value.getTime?.() || 0;
 }
 
 function timeLabel(seconds) {
@@ -256,7 +292,7 @@ function minMax(values) {
 async function parseEdfFile(input, mode = "summary") {
   const file = input.file || input;
   const relativePath = input.relativePath || file.webkitRelativePath || file.name;
-  const parsed = await parseEdfEntry({ file, name: file.name || relativePath, relativePath }, mode);
+  const parsed = await parseEdfEntry({ file, name: file.name || relativePath, relativePath }, mode, input.crcSidecar, input.options || {});
   return {
     ...parsed,
     sourceFile: file,
@@ -268,7 +304,11 @@ async function hydrateSignals(fileRecord, mode = "detail") {
   if (fileRecord.header.labels.includes("EDF Annotations")) {
     return { ...fileRecord, signalsLoaded: true };
   }
-  const parsed = await parseEdfFile({ file: fileRecord.sourceFile, relativePath: fileRecord.relativePath }, mode);
+  const parsed = await parseEdfFile({
+    file: fileRecord.sourceFile,
+    relativePath: fileRecord.relativePath,
+    options: { skipCrc: true, parseAnnotations: false },
+  }, mode);
   return {
     ...fileRecord,
     signals: { ...fileRecord.signals, ...parsed.signals },
@@ -283,7 +323,7 @@ async function hydrateSignalFiles(files, mode = "detail") {
     .map((file) => ({ file: file.sourceFile, name: file.fileName, relativePath: file.relativePath }));
   const workerResult = entries.length ? await requestWorkerFiles("hydrateFiles", entries, mode) : null;
   if (workerResult) {
-    const byPath = new Map(workerResult.map((file) => [file.relativePath, file]));
+    const byPath = new Map(workerResult.files.map((file) => [file.relativePath, file]));
     return files.map((file) => {
       const hydrated = byPath.get(file.relativePath);
       if (!hydrated) return file;
@@ -350,14 +390,15 @@ function groupByType(files) {
 }
 
 function relativeStart(file, groupStartMs) {
-  if (!file?.header.startedAt || !Number.isFinite(groupStartMs)) return 0;
-  return Math.max(0, (file.header.startedAt.getTime() - groupStartMs) / 1000);
+  const startMs = fileStartMs(file);
+  if (!startMs || !Number.isFinite(groupStartMs)) return 0;
+  return Math.max(0, (startMs - groupStartMs) / 1000);
 }
 
 function combinedSignal(files, type, label, groupStartMs) {
   return files
     .filter((file) => file.header.type === type && file.signals?.[label]?.length)
-    .sort((a, b) => (a.header.startedAt?.getTime() || 0) - (b.header.startedAt?.getTime() || 0))
+    .sort((a, b) => fileStartMs(a) - fileStartMs(b))
     .flatMap((file) => {
       const offset = relativeStart(file, groupStartMs);
       return file.signals[label].map((point) => ({ ...point, t: point.t + offset }));
@@ -379,11 +420,11 @@ function buildSession(files) {
   const primary =
     files
       .filter((file) => file.header.type !== "STR")
-      .sort((a, b) => (a.header.startedAt?.getTime() || 0) - (b.header.startedAt?.getTime() || 0))[0] ||
+      .sort((a, b) => fileStartMs(a) - fileStartMs(b))[0] ||
     str ||
     files[0] ||
     null;
-  const groupStartMs = primary?.header.startedAt?.getTime() || null;
+  const groupStartMs = primary ? fileStartMs(primary) || null : null;
 
   const flow = combinedSignal(files, "BRP", "Flow.40ms", groupStartMs);
   const pressure40ms = combinedSignal(files, "BRP", "Press.40ms", groupStartMs);
@@ -461,8 +502,8 @@ function buildSession(files) {
     files,
     grouped,
     primary,
-    start: primary?.header.startedAt || null,
-    date: isoDate(primary?.header.startedAt || null),
+    start: primary?.header.startedAtCivil || primary?.header.startedAt || null,
+    date: isoDate(primary?.header.startedAtCivil || primary?.header.startedAt || null),
     therapySeconds,
     eventCounts: {
       all: events.length,
@@ -565,9 +606,65 @@ function crcOverview(files) {
   );
 }
 
+function crcDiagnostics(files) {
+  const overview = crcOverview(files);
+  const pendingFiles = files.filter((file) => file.crc?.internal && !file.crc.internal.checked).length;
+  return {
+    validating: false,
+    checkedRecords: overview.checked,
+    badRecords: overview.bad,
+    pendingFiles,
+    sidecars: overview.sidecars,
+    missingSidecars: overview.missingSidecars,
+  };
+}
+
+function crcDiagnosticsFromResults(results, totalFiles) {
+  const checkedRecords = results.reduce((sum, row) => sum + (row.crc?.internal?.total || 0), 0);
+  const badRecords = results.reduce((sum, row) => sum + (row.crc?.internal?.bad || 0), 0);
+  const sidecarEligible = results.filter((row) => row.type !== "STR");
+  const sidecars = sidecarEligible.filter((row) => row.crc?.sidecar?.present).length;
+  return {
+    validating: false,
+    checkedRecords,
+    badRecords,
+    pendingFiles: Math.max(0, totalFiles - results.length),
+    sidecars,
+    missingSidecars: Math.max(0, sidecarEligible.length - sidecars),
+  };
+}
+
+function mergeCrcResults(files, results) {
+  const byPath = new Map(results.map((row) => [row.relativePath, row]));
+  return files.map((file) => {
+    const updated = byPath.get(file.relativePath);
+    if (!updated) return file;
+    return {
+      ...file,
+      crc: {
+        ...file.crc,
+        ...updated.crc,
+      },
+    };
+  });
+}
+
+function mergeDiagnostics(base, updates) {
+  return {
+    ...base,
+    ...updates,
+    crc: {
+      ...base.crc,
+      ...(updates.crc || {}),
+    },
+  };
+}
+
 function crcStatusLabel(row) {
-  if (!row.crc?.internal?.checked) return "not checked";
   const internal = row.crc.internal;
+  if (!internal?.checked && /pending/i.test(internal?.reason || "")) return "CRC pending";
+  if (!internal?.checked) return "not checked";
+  if (/pending/i.test(internal.reason || "")) return "CRC pending";
   const recordStatus = internal.bad ? `${internal.bad}/${internal.total} bad` : `${internal.total}/${internal.total} ok`;
   const sidecarStatus = row.crc.sidecar?.present ? "sidecar" : "no sidecar";
   return `${recordStatus}, ${sidecarStatus}`;
@@ -604,8 +701,8 @@ function buildDailyRows(files) {
     .forEach((file) => {
       for (let record = 0; record < file.header.recordCount; record += 1) {
         const dateSignal = signalRecordValue(file, "Date", record);
-        const date = dateFromUnixDay(dateSignal) || (file.header.startedAt
-          ? new Date(file.header.startedAt.getTime() + record * file.header.recordDuration * 1000)
+        const date = dateFromUnixDay(dateSignal) || (Number.isFinite(file.header.startedAtMs)
+          ? new Date(file.header.startedAtMs + record * file.header.recordDuration * 1000)
           : null);
         const leak95 = signalRecordValue(file, "Leak.95", record);
         const maskOns = signalRecordSamples(file, "MaskOn", record);
@@ -654,7 +751,7 @@ function datalogGroupKey(file) {
 }
 
 function fileStartMs(file) {
-  return file.header.startedAt?.getTime() || 0;
+  return file.header.startedAtMs || file.header.startedAt?.getTime() || 0;
 }
 
 function fileDurationMs(file) {
@@ -667,14 +764,16 @@ function fileDurationMs(file) {
 
 function clockLabel(date) {
   if (!date) return "--:--";
-  return `${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}`;
+  if (Number.isFinite(date)) return civilClockLabel(epochMsToCivil(date));
+  if (date.year) return civilClockLabel(date);
+  return `${String(date.getUTCHours()).padStart(2, "0")}:${String(date.getUTCMinutes()).padStart(2, "0")}`;
 }
 
 function findMaskWindowForCluster(cluster, dailyRows) {
   if (!cluster.startMs) return null;
   const start = new Date(cluster.startMs);
   const date = isoDate(start);
-  const minute = start.getHours() * 60 + start.getMinutes();
+  const minute = start.getUTCHours() * 60 + start.getUTCMinutes();
   const row = dailyRows.find((item) => item.date === date);
   const window = row?.maskWindows?.find((item) => minute >= item.on && minute <= item.off);
   return window ? `${minuteOfDayLabel(window.on)}-${minuteOfDayLabel(window.rawOff)}` : null;
@@ -705,10 +804,10 @@ function buildSessionClusters(groupId, files, dailyRows = []) {
     const maskWindow = findMaskWindowForCluster(cluster, dailyRows);
     return {
       id: `${groupId}#${index + 1}`,
-      label: `${clockLabel(cluster.startMs ? new Date(cluster.startMs) : null)}-${clockLabel(cluster.endMs ? new Date(cluster.endMs) : null)}`,
+      label: `${clockLabel(cluster.startMs || null)}-${clockLabel(cluster.endMs || null)}`,
       maskWindow,
-      start: cluster.startMs ? new Date(cluster.startMs) : null,
-      end: cluster.endMs ? new Date(cluster.endMs) : null,
+      start: cluster.startMs ? epochMsToCivil(cluster.startMs) : null,
+      end: cluster.endMs ? epochMsToCivil(cluster.endMs) : null,
       endSeconds: cluster.startMs && cluster.endMs ? (cluster.endMs - cluster.startMs) / 1000 : 0,
       files: cluster.files,
       typeCounts: cluster.typeCounts,
@@ -729,10 +828,11 @@ function buildTherapyGroups(files, dailyRows = []) {
     .map(([id, groupFiles]) => {
       const sorted = groupFiles
         .slice()
-        .sort((a, b) => (a.header.startedAt?.getTime() || 0) - (b.header.startedAt?.getTime() || 0));
-      const start = sorted.find((file) => file.header.startedAt)?.header.startedAt || null;
+        .sort((a, b) => fileStartMs(a) - fileStartMs(b));
+      const startFile = sorted.find((file) => fileStartMs(file));
+      const start = startFile?.header.startedAtCivil || startFile?.header.startedAt || null;
       const endSeconds = start
-        ? Math.max(...sorted.map((file) => fileEndSeconds(file, start.getTime())))
+        ? Math.max(...sorted.map((file) => fileEndSeconds(file, fileStartMs(startFile))))
         : 0;
       const typeCounts = sorted.reduce((counts, file) => {
         counts[file.header.type] = (counts[file.header.type] || 0) + 1;
@@ -749,7 +849,7 @@ function buildTherapyGroups(files, dailyRows = []) {
         sessions,
       };
     })
-    .sort((a, b) => (a.start?.getTime() || 0) - (b.start?.getTime() || 0));
+    .sort((a, b) => civilToSortMs(a.start) - civilToSortMs(b.start));
 }
 
 function statusForSignal(series) {
@@ -1534,6 +1634,73 @@ function CrcNotePanel() {
   );
 }
 
+function ImportDiagnosticsPanel({ diagnostics }) {
+  if (!diagnostics?.totalInput && !diagnostics?.parsed) return null;
+  const crc = diagnostics.crc || EMPTY_DIAGNOSTICS.crc;
+  const crcText = crc.validating
+    ? `${crc.checkedRecords.toLocaleString()} records checked, ${crc.pendingFiles} files pending`
+    : crc.pendingFiles
+      ? `${crc.pendingFiles} files pending`
+      : `${crc.checkedRecords.toLocaleString()} records checked`;
+  const failures = diagnostics.failures || [];
+
+  return (
+    <Panel title="Import diagnostics" note={diagnostics.parseMs ? `${compact(diagnostics.parseMs / 1000, 2)}s scan` : "latest import"}>
+      <div className="diagnostics-grid">
+        <div>
+          <span>Input files</span>
+          <strong>{diagnostics.totalInput}</strong>
+        </div>
+        <div>
+          <span>Parsed EDF</span>
+          <strong>{diagnostics.parsed}</strong>
+        </div>
+        <div>
+          <span>Skipped</span>
+          <strong>{diagnostics.skipped}</strong>
+        </div>
+        <div>
+          <span>Failed</span>
+          <strong>{diagnostics.failed}</strong>
+        </div>
+        <div>
+          <span>Cache</span>
+          <strong>{diagnostics.cacheHits}/{diagnostics.cacheHits + diagnostics.cacheMisses}</strong>
+        </div>
+        <div>
+          <span>CRC</span>
+          <strong>{crc.badRecords ? `${crc.badRecords} bad` : crcText}</strong>
+        </div>
+        <div>
+          <span>Sidecars</span>
+          <strong>{crc.sidecars}/{crc.sidecars + crc.missingSidecars}</strong>
+        </div>
+        <div>
+          <span>Mode</span>
+          <strong>{crc.validating || crc.pendingFiles ? "fast scan" : "complete"}</strong>
+        </div>
+      </div>
+      {failures.length ? (
+        <div className="failure-list">
+          {failures.slice(0, 6).map((failure) => (
+            <div key={failure.relativePath}>
+              <strong>{failure.relativePath}</strong>
+              <span>{failure.error}</span>
+            </div>
+          ))}
+          {failures.length > 6 ? <p>{failures.length - 6} more failed files hidden.</p> : null}
+        </div>
+      ) : null}
+      {diagnostics.skippedFiles?.length ? (
+        <div className="note-box">
+          <Info size={16} />
+          Skipped {diagnostics.skipped} non-EDF side files from the selected folder.
+        </div>
+      ) : null}
+    </Panel>
+  );
+}
+
 function ExportOverview({
   parsed,
   groups,
@@ -1549,6 +1716,7 @@ function ExportOverview({
   const latestGroup = groups[groups.length - 1];
   const selectedNight = groups.find((group) => group.id === selectedNightId) || latestGroup;
   const crc = crcOverview(parsed);
+  const pendingCrcFiles = parsed.filter((file) => file.crc?.internal && !file.crc.internal.checked).length;
 
   return (
     <Panel title="Export overview" note={strLoaded ? `${dailyRows.length} STR daily records` : "No STR summary loaded"}>
@@ -1567,7 +1735,7 @@ function ExportOverview({
         </div>
         <div>
           <span>CRC records</span>
-          <strong>{crc.bad ? `${crc.bad} bad` : `${crc.checked} ok`}</strong>
+          <strong>{pendingCrcFiles ? `${pendingCrcFiles} pending` : crc.bad ? `${crc.bad} bad` : `${crc.checked} ok`}</strong>
         </div>
       </div>
       {groups.length ? (
@@ -1607,7 +1775,7 @@ function ExportOverview({
   );
 }
 
-function Dashboard({ parsed, onReset }) {
+function Dashboard({ parsed, diagnostics, onReset }) {
   const dailyRows = useMemo(() => buildDailyRows(parsed), [parsed]);
   const groups = useMemo(() => buildTherapyGroups(parsed, dailyRows), [parsed, dailyRows]);
   const [selectedNightId, setSelectedNightId] = useState("");
@@ -1786,6 +1954,7 @@ function Dashboard({ parsed, onReset }) {
 
       <PreferencesPanel prefs={prefs} onChange={setPrefs} />
       <CrcNotePanel />
+      <ImportDiagnosticsPanel diagnostics={diagnostics} />
 
       <div className="content-grid">
         <Panel title="Therapy timeline" note="pressure, leak, respiratory rate">
@@ -1863,22 +2032,112 @@ export default function CpapDashboard() {
   const [loading, setLoading] = useState(false);
   const [progress, setProgress] = useState(null);
   const [cacheStats, setCacheStats] = useState({ hits: 0, misses: 0 });
+  const [diagnostics, setDiagnostics] = useState(EMPTY_DIAGNOSTICS);
   const parseAbortRef = useRef(null);
+  const importRunRef = useRef(0);
+
+  function withSidecarState(files, sourceByPath, crcByPath) {
+    return files.map((file) => {
+      const crcPath = file.relativePath.replace(/\.edf$/i, ".crc");
+      const sidecar = crcByPath.get(crcPath);
+      return {
+        ...file,
+        sourceFile: sourceByPath.get(file.relativePath),
+        crc: {
+          ...file.crc,
+          sidecar: sidecar
+            ? {
+                present: true,
+                bytes: sidecar.file.size || file.crc?.sidecar?.bytes || 0,
+                hex: file.crc?.sidecar?.hex || "",
+              }
+            : { present: false, bytes: 0, hex: "" },
+        },
+      };
+    });
+  }
+
+  function sortParsedFiles(files) {
+    return files.slice().sort((a, b) => fileStartMs(a) - fileStartMs(b) || a.relativePath.localeCompare(b.relativePath));
+  }
+
+  async function validateCrcInBackground(runId, edfEntries, crcEntries) {
+    setDiagnostics((current) => mergeDiagnostics(current, {
+      crc: {
+        ...current.crc,
+        validating: true,
+        pendingFiles: edfEntries.length,
+      },
+    }));
+    try {
+      const result = await requestWorkerFiles("validateCrc", [...edfEntries, ...crcEntries], "crc", {
+        onProgress: (event) => {
+          if (runId !== importRunRef.current) return;
+          setDiagnostics((current) => mergeDiagnostics(current, {
+            crc: {
+              ...current.crc,
+              validating: true,
+              pendingFiles: Math.max(0, edfEntries.length - event.done),
+            },
+          }));
+        },
+      });
+      if (runId !== importRunRef.current) return;
+      if (!result) {
+        setDiagnostics((current) => mergeDiagnostics(current, {
+          crc: {
+            ...current.crc,
+            validating: false,
+          },
+        }));
+        return;
+      }
+      const crcFailures = result.failures || [];
+      setParsed((current) => mergeCrcResults(current, result.results || []));
+      setDiagnostics((previous) => {
+        const mergedFailures = [...(previous.failures || []), ...crcFailures];
+        return mergeDiagnostics(previous, {
+          failed: mergedFailures.length,
+          failures: mergedFailures,
+          crc: crcDiagnosticsFromResults(result.results || [], previous.parsed || edfEntries.length),
+        });
+      });
+    } catch (err) {
+      if (runId !== importRunRef.current) return;
+      setDiagnostics((current) => mergeDiagnostics(current, {
+        failures: [
+          ...(current.failures || []),
+          { fileName: "CRC validation", relativePath: "CRC validation", error: err instanceof Error ? err.message : "CRC validation failed" },
+        ],
+        failed: (current.failures || []).length + 1,
+        crc: {
+          ...current.crc,
+          validating: false,
+        },
+      }));
+    }
+  }
 
   async function parseFiles(inputEntries) {
+    const startedAt = performance.now();
+    const runId = importRunRef.current + 1;
+    importRunRef.current = runId;
     const entries = inputEntries[0]?.file ? inputEntries : fileEntriesFromList(inputEntries);
-    const edfEntries = entries.filter((entry) => /\.edf$/i.test(entry.name));
+    const relevantEntries = entries.filter((entry) => /\.(edf|crc)$/i.test(entry.name));
+    const skippedEntries = entries.filter((entry) => !/\.(edf|crc)$/i.test(entry.name));
+    const edfEntries = relevantEntries.filter((entry) => /\.edf$/i.test(entry.name));
     const sourceByPath = new Map(edfEntries.map((entry) => [entry.relativePath, entry.file]));
-    const crcEntries = entries.filter((entry) => /\.crc$/i.test(entry.name));
+    const crcEntries = relevantEntries.filter((entry) => /\.crc$/i.test(entry.name));
     const crcByPath = new Map(crcEntries.map((entry) => [entry.relativePath, entry]));
     const { cached, missing } = await getCachedSummaries(edfEntries);
     setCacheStats({ hits: cached.size, misses: missing.length });
     let parsedFiles = [...cached.values()];
+    let failures = [];
     setProgress({ done: cached.size, total: edfEntries.length, fileName: cached.size ? "cache" : "" });
 
     if (missing.length) {
       const workerEntries = [...missing, ...crcEntries];
-      const parsedMissing = await requestWorkerFiles("parseFiles", workerEntries, "summary", {
+      const parsedMissing = await requestWorkerFiles("parseFiles", workerEntries, "scan", {
         signal: parseAbortRef.current?.signal,
         onProgress: (event) => {
           setProgress({
@@ -1889,41 +2148,56 @@ export default function CpapDashboard() {
         },
       });
       if (parsedMissing) {
-        parsedFiles = [...parsedFiles, ...parsedMissing];
-        await putCachedSummaries(missing, parsedMissing);
+        parsedFiles = [...parsedFiles, ...parsedMissing.files];
+        failures = [...failures, ...parsedMissing.failures];
+        await putCachedSummaries(missing, parsedMissing.files);
       } else {
         for (let index = 0; index < missing.length; index += 1) {
           if (parseAbortRef.current?.signal.aborted) throw new Error("Parsing cancelled");
-          parsedFiles.push(await parseEdfFile(missing[index], "summary"));
+          try {
+            parsedFiles.push(await parseEdfFile({ ...missing[index], options: { skipCrc: true } }, "scan"));
+          } catch (err) {
+            failures.push({
+              fileName: missing[index].name,
+              relativePath: missing[index].relativePath,
+              error: err instanceof Error ? err.message : "Failed to parse EDF file",
+            });
+          }
           setProgress({ done: cached.size + index + 1, total: edfEntries.length, fileName: missing[index].relativePath });
         }
       }
     }
 
-    parsedFiles = parsedFiles.map((file) => ({
-      ...file,
-      sourceFile: sourceByPath.get(file.relativePath),
+    parsedFiles = sortParsedFiles(withSidecarState(parsedFiles, sourceByPath, crcByPath));
+    const baseDiagnostics = {
+      totalInput: entries.length,
+      supportedInput: relevantEntries.length,
+      skipped: skippedEntries.length,
+      skippedFiles: skippedEntries.slice(0, 20).map((entry) => entry.relativePath),
+      edf: edfEntries.length,
+      crcFiles: crcEntries.length,
+      parsed: parsedFiles.length,
+      failed: failures.length,
+      failures,
+      cacheHits: cached.size,
+      cacheMisses: missing.length,
+      parseMs: performance.now() - startedAt,
       crc: {
-        ...file.crc,
-        sidecar: crcByPath.has(file.relativePath.replace(/\.edf$/i, ".crc"))
-          ? {
-              present: true,
-              bytes: crcByPath.get(file.relativePath.replace(/\.edf$/i, ".crc")).file.size || 0,
-              hex: file.crc?.sidecar?.hex || "",
-            }
-          : file.crc?.sidecar || { present: false, bytes: 0, hex: "" },
+        ...crcDiagnostics(parsedFiles),
+        validating: parsedFiles.length > 0,
       },
-    }));
-    parsedFiles.sort((a, b) => {
-      const aTime = a.header.startedAt?.getTime() || 0;
-      const bTime = b.header.startedAt?.getTime() || 0;
-      return aTime - bTime || a.relativePath.localeCompare(b.relativePath);
-    });
+    };
+    setDiagnostics(baseDiagnostics);
+    if (!parsedFiles.length) {
+      throw new Error(failures.length ? `No EDF files could be parsed (${failures.length} failed).` : "No EDF files were parsed.");
+    }
     setParsed(parsedFiles);
+    validateCrcInBackground(runId, edfEntries, crcEntries);
   }
 
   async function handleLoad(entries) {
     setError("");
+    setDiagnostics(EMPTY_DIAGNOSTICS);
     if (!entries.length || !entries.some((entry) => /\.edf$/i.test(entry.name))) {
       setError("No EDF files were selected.");
       return;
@@ -1946,6 +2220,13 @@ export default function CpapDashboard() {
     parseAbortRef.current?.abort();
   }
 
+  function handleReset() {
+    importRunRef.current += 1;
+    setParsed([]);
+    setDiagnostics(EMPTY_DIAGNOSTICS);
+    setError("");
+  }
+
   async function handleClearCache() {
     await clearParseCache();
     setCacheStats({ hits: 0, misses: 0 });
@@ -1953,6 +2234,7 @@ export default function CpapDashboard() {
 
   async function handleLoadSample() {
     setError("");
+    setDiagnostics(EMPTY_DIAGNOSTICS);
     setLoading(true);
     setProgress(null);
     parseAbortRef.current = new AbortController();
@@ -1984,7 +2266,7 @@ export default function CpapDashboard() {
     <div className="app-shell">
       <style>{styles}</style>
       {parsed.length ? (
-        <Dashboard parsed={parsed} onReset={() => setParsed([])} />
+        <Dashboard parsed={parsed} diagnostics={diagnostics} onReset={handleReset} />
       ) : (
         <UploadPanel
           onLoad={handleLoad}
@@ -2297,6 +2579,12 @@ code {
   gap: 8px;
 }
 
+.diagnostics-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+}
+
 .overview-grid div {
   padding: 12px;
   background: ${COLORS.panel2};
@@ -2304,7 +2592,15 @@ code {
   border-radius: 8px;
 }
 
+.diagnostics-grid div {
+  padding: 11px;
+  background: ${COLORS.panel2};
+  border: 1px solid ${COLORS.border};
+  border-radius: 8px;
+}
+
 .overview-grid span,
+.diagnostics-grid span,
 .night-picker label,
 .night-picker span {
   display: block;
@@ -2321,6 +2617,43 @@ code {
   color: ${COLORS.text};
   font-family: "SFMono-Regular", Consolas, monospace;
   font-size: 20px;
+}
+
+.diagnostics-grid strong {
+  display: block;
+  margin-top: 5px;
+  color: ${COLORS.text};
+  font-family: "SFMono-Regular", Consolas, monospace;
+  font-size: 16px;
+  overflow-wrap: anywhere;
+}
+
+.failure-list {
+  display: grid;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.failure-list div {
+  display: grid;
+  gap: 3px;
+  padding: 10px;
+  background: rgba(255, 119, 105, 0.08);
+  border: 1px solid rgba(255, 119, 105, 0.24);
+  border-radius: 8px;
+}
+
+.failure-list strong {
+  color: ${COLORS.text};
+  font-family: "SFMono-Regular", Consolas, monospace;
+  font-size: 12px;
+}
+
+.failure-list span,
+.failure-list p {
+  margin: 0;
+  color: ${COLORS.muted};
+  font-size: 12px;
 }
 
 .night-picker {
@@ -2653,6 +2986,7 @@ tbody tr {
   .signal-health,
   .event-counts,
   .overview-grid,
+  .diagnostics-grid,
   .night-picker,
   .mask-row,
   .preferences-grid {

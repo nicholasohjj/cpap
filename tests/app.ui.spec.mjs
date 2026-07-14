@@ -5,6 +5,7 @@ test("loads bundled sample and exposes core workflows", async ({ page }) => {
   await page.getByRole("button", { name: /load sample/i }).click();
 
   await expect(page.getByText("Export overview")).toBeVisible({ timeout: 15000 });
+  await expect(page.getByText("Import diagnostics")).toBeVisible();
   await expect(page.getByText("DATALOG nights")).toBeVisible();
   await expect(page.getByText("CRC records")).toBeVisible();
   await expect(page.locator(".event-counts").getByText("Central", { exact: true })).toBeVisible();
