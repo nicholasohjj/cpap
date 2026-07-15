@@ -1132,18 +1132,26 @@ function CanvasWaveform({ data }) {
     const values = data.map((point) => point.flow).filter(Number.isFinite);
     const min = Math.min(...values);
     const max = Math.max(...values);
-    const pad = 22;
+    const minLabel = `${compact(min, 2)} L/s`;
+    const maxLabel = `${compact(max, 2)} L/s`;
+    ctx.font = "11px SFMono-Regular, Consolas, monospace";
+    const leftPad = Math.ceil(Math.max(ctx.measureText(minLabel).width, ctx.measureText(maxLabel).width)) + 16;
+    const rightPad = 24;
+    const topPad = 24;
+    const bottomPad = 34;
+    const plotWidth = Math.max(1, width - leftPad - rightPad);
+    const plotHeight = Math.max(1, height - topPad - bottomPad);
     const range = Math.max(0.1, max - min);
-    const xFor = (index) => pad + (index / Math.max(1, data.length - 1)) * (width - pad * 2);
-    const yFor = (value) => height - pad - ((value - min) / range) * (height - pad * 2);
+    const xFor = (index) => leftPad + (index / Math.max(1, data.length - 1)) * plotWidth;
+    const yFor = (value) => topPad + (1 - (value - min) / range) * plotHeight;
 
     ctx.strokeStyle = COLORS.grid;
     ctx.lineWidth = 1;
     ctx.beginPath();
     for (let i = 0; i < 5; i += 1) {
-      const y = pad + (i / 4) * (height - pad * 2);
-      ctx.moveTo(pad, y);
-      ctx.lineTo(width - pad, y);
+      const y = topPad + (i / 4) * plotHeight;
+      ctx.moveTo(leftPad, y);
+      ctx.lineTo(width - rightPad, y);
     }
     ctx.stroke();
 
@@ -1159,12 +1167,14 @@ function CanvasWaveform({ data }) {
     ctx.stroke();
 
     ctx.fillStyle = COLORS.muted;
-    ctx.font = "11px SFMono-Regular, Consolas, monospace";
-    ctx.fillText(`${compact(max, 2)} L/s`, 6, pad);
-    ctx.fillText(`${compact(min, 2)} L/s`, 6, height - 8);
-    ctx.fillText(data[0]?.label || "00:00:00", pad, height - 6);
+    ctx.textAlign = "left";
+    ctx.textBaseline = "middle";
+    ctx.fillText(maxLabel, 8, topPad);
+    ctx.fillText(minLabel, 8, topPad + plotHeight);
+    ctx.textBaseline = "alphabetic";
+    ctx.fillText(data[0]?.label || "00:00:00", leftPad, height - 8);
     ctx.textAlign = "right";
-    ctx.fillText(data[data.length - 1]?.label || "", width - pad, height - 6);
+    ctx.fillText(data[data.length - 1]?.label || "", width - rightPad, height - 8);
   }, [data]);
 
   return (
@@ -1279,16 +1289,24 @@ function EventsChart({ session }) {
     color: /central/i.test(event.label) ? COLORS.amber : /obstructive/i.test(event.label) ? COLORS.coral : COLORS.blue,
   }));
   if (!data.length) return <EmptyState label="No scored respiratory events were found." />;
+  const eventStart = Math.min(...data.map((event) => event.onset));
+  const eventEnd = Math.max(...data.map((event) => event.onset));
+  const eventSpan = Math.max(1, eventEnd - eventStart);
+  const axisPadding = Math.max(60, eventSpan * 0.06);
 
   return (
     <ResponsiveContainer width="100%" height={130}>
-      <ComposedChart data={data} margin={{ top: 10, right: 18, left: -20, bottom: 0 }}>
+      <ComposedChart data={data} margin={{ top: 10, right: 30, left: 8, bottom: 0 }}>
         <XAxis
-          dataKey="time"
+          type="number"
+          dataKey="onset"
+          domain={[eventStart - axisPadding, eventEnd + axisPadding]}
           minTickGap={34}
+          tickFormatter={timeLabel}
           tick={{ fill: COLORS.faint, fontSize: 11 }}
           axisLine={{ stroke: COLORS.border }}
           tickLine={false}
+          tickMargin={8}
         />
         <YAxis hide domain={[0, 1.4]} />
         <Tooltip
@@ -2568,7 +2586,7 @@ code {
 
 .event-counts {
   display: grid;
-  grid-template-columns: repeat(3, 1fr);
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 8px;
   margin-bottom: 8px;
 }
@@ -2819,6 +2837,7 @@ code {
 
 .event-counts div,
 .signal-health div {
+  min-width: 0;
   padding: 10px;
   background: ${COLORS.panel2};
   border: 1px solid ${COLORS.border};
@@ -2830,6 +2849,7 @@ code {
   display: block;
   color: ${COLORS.muted};
   font-size: 11px;
+  overflow-wrap: anywhere;
 }
 
 .event-counts strong,
