@@ -2,16 +2,25 @@ import React, { useEffect, useMemo, useRef, useState } from "react";
 import {
   Activity,
   AlertCircle,
+  ArrowLeft,
+  ArrowRight,
+  BarChart3,
   CalendarDays,
+  Download,
   Droplets,
+  FileText,
   FolderOpen,
   Gauge,
   Info,
   ListChecks,
   Moon,
+  Printer,
   RefreshCw,
+  Search,
   Upload,
   Wind,
+  ZoomIn,
+  ZoomOut,
 } from "lucide-react";
 import {
   CartesianGrid,
@@ -47,6 +56,11 @@ const COLORS = {
 
 const KNOWN_TYPES = ["STR", "BRP", "PLD", "SAD", "EVE", "CSL"];
 const PARSE_CACHE_VERSION = "v3";
+const COMPLIANCE_MINUTES = 240;
+const LEAK_REVIEW_L_MIN = 24;
+const EVENT_CLUSTER_GAP_SECONDS = 180;
+const EVENT_CLUSTER_MIN_EVENTS = 3;
+const EVENT_FOCUS_PAD_SECONDS = 90;
 const EMPTY_DIAGNOSTICS = {
   totalInput: 0,
   supportedInput: 0,
@@ -247,6 +261,11 @@ function compact(value, digits = 1) {
   return rounded === null ? "--" : String(rounded);
 }
 
+function clamp(value, min, max) {
+  if (!Number.isFinite(value)) return min;
+  return Math.min(max, Math.max(min, value));
+}
+
 function leakUnitLabel(prefs) {
   return prefs.leakUnit === "lps" ? "L/s" : "L/min";
 }
@@ -414,6 +433,77 @@ function fileEndSeconds(file, groupStartMs) {
   return relativeStart(file, groupStartMs) + Math.max(recordSpan, annotationEnd);
 }
 
+function isRespiratoryEvent(event) {
+  return /(apnea|hypopnea|rera|flow limitation)/i.test(event.label || "");
+}
+
+function eventBucket(label) {
+  if (/central/i.test(label)) return "Central";
+  if (/obstructive/i.test(label)) return "Obstructive";
+  if (/hypopnea/i.test(label)) return "Hypopnea";
+  if (/rera/i.test(label)) return "RERA";
+  if (/flow limitation/i.test(label)) return "Flow limitation";
+  if (/apnea/i.test(label)) return "Apnea";
+  return label || "Event";
+}
+
+function eventTypeSummary(events) {
+  const counts = events.reduce((out, event) => {
+    const label = eventBucket(event.label);
+    out[label] = (out[label] || 0) + 1;
+    return out;
+  }, {});
+  return Object.entries(counts)
+    .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+    .map(([label, count]) => `${label} ${count}`)
+    .join(", ");
+}
+
+function buildEventClusters(events) {
+  const respiratory = events
+    .filter(isRespiratoryEvent)
+    .slice()
+    .sort((a, b) => a.onset - b.onset);
+  const clusters = [];
+  let current = [];
+
+  const flush = () => {
+    if (current.length >= EVENT_CLUSTER_MIN_EVENTS) {
+      const start = current[0].onset;
+      const end = Math.max(...current.map((event) => event.onset + event.duration));
+      const duration = Math.max(1, end - start);
+      clusters.push({
+        id: clusters.length + 1,
+        start,
+        end,
+        startLabel: timeLabel(start),
+        endLabel: timeLabel(end),
+        duration,
+        count: current.length,
+        rate: current.length / (duration / 3600),
+        longestSeconds: Math.max(...current.map((event) => event.duration || 0)),
+        avgPressure: mean(current.map((event) => event.pressure)),
+        avgLeak: mean(current.map((event) => event.leak)),
+        typeSummary: eventTypeSummary(current),
+        events: current,
+      });
+    }
+    current = [];
+  };
+
+  respiratory.forEach((event) => {
+    const last = current[current.length - 1];
+    if (!last || event.onset - (last.onset + last.duration) <= EVENT_CLUSTER_GAP_SECONDS) {
+      current.push(event);
+      return;
+    }
+    flush();
+    current.push(event);
+  });
+  flush();
+  return clusters;
+}
+
 function buildSession(files) {
   const grouped = groupByType(files);
   const str = grouped.STR[0] || null;
@@ -497,6 +587,13 @@ function buildSession(files) {
   const respValues = respiration.map((point) => point.value);
   const spo2Values = spo2.map((point) => point.value).filter((value) => Number.isFinite(value) && value >= 0);
   const pulseValues = pulse.map((point) => point.value).filter((value) => Number.isFinite(value) && value > 0);
+  const annotatedEvents = events.map((event) => ({
+    ...event,
+    time: timeLabel(event.onset),
+    pressure: nearestAt(pressure.length ? pressure : pressure40ms, event.onset),
+    leak: nearestAt(leak, event.onset),
+  }));
+  const eventClusters = buildEventClusters(annotatedEvents);
 
   return {
     files,
@@ -550,12 +647,8 @@ function buildSession(files) {
       flow,
       pressure40ms,
     },
-    events: events.map((event) => ({
-      ...event,
-      time: timeLabel(event.onset),
-      pressure: nearestAt(pressure.length ? pressure : pressure40ms, event.onset),
-      leak: nearestAt(leak, event.onset),
-    })),
+    events: annotatedEvents,
+    eventClusters,
     segments,
     gaps,
   };
@@ -733,6 +826,112 @@ function buildDailyRows(files) {
       }
     });
   return rows.sort((a, b) => a.date.localeCompare(b.date));
+}
+
+function recentDailyRows(rows, count = 30) {
+  return rows
+    .filter((row) => row.date)
+    .slice()
+    .sort((a, b) => a.date.localeCompare(b.date))
+    .slice(-count);
+}
+
+function buildComplianceReport(rows) {
+  const recentRows = recentDailyRows(rows, 30);
+  const usageRows = recentRows.filter((row) => Number.isFinite(row.usageMinutes));
+  const compliantRows = usageRows.filter((row) => row.usageMinutes >= COMPLIANCE_MINUTES);
+  return {
+    rows: recentRows,
+    nights: recentRows.length,
+    nightsWithUsage: usageRows.length,
+    compliantNights: compliantRows.length,
+    percent: usageRows.length ? (compliantRows.length / usageRows.length) * 100 : null,
+    avgUsageHours: mean(usageRows.map((row) => row.usageMinutes / 60)),
+    avgAhi: mean(recentRows.map((row) => row.ahi)),
+    avgLeak95LMin: mean(recentRows.map((row) => row.leak95LMin)),
+    avgPressure95: mean(recentRows.map((row) => row.pressure95)),
+    startDate: recentRows[0]?.date || "",
+    endDate: recentRows[recentRows.length - 1]?.date || "",
+  };
+}
+
+function valueOrFallback(primary, fallback) {
+  return Number.isFinite(primary) ? primary : fallback;
+}
+
+function buildSleepSummary(session, dailyRows, prefs) {
+  const dailyForDate = dailyRows.find((row) => row.date === session.date) || dailyRows[dailyRows.length - 1] || null;
+  const therapySeconds = session.therapySeconds > 0
+    ? session.therapySeconds
+    : (Number.isFinite(dailyForDate?.usageMinutes) ? dailyForDate.usageMinutes * 60 : null);
+  const ahi = valueOrFallback(session.indexes.ahi, dailyForDate?.ahi);
+  const leak95LMin = Number.isFinite(session.stats.leak95)
+    ? session.stats.leak95 * 60
+    : dailyForDate?.leak95LMin;
+  const pressure95 = valueOrFallback(session.stats.pressure95, dailyForDate?.pressure95);
+  const pressureMedian = session.stats.pressureMedian;
+  const leakDisplay = leakFromLmin(leak95LMin, prefs);
+  const review = [];
+  const positives = [];
+  const signalWarnings = [];
+
+  if (therapySeconds > 0) {
+    if (therapySeconds < COMPLIANCE_MINUTES * 60) {
+      review.push(`Therapy time was ${durationLabel(therapySeconds)}, below the common 4-hour compliance threshold.`);
+    } else {
+      positives.push(`Therapy time was ${durationLabel(therapySeconds)}, meeting the common 4-hour compliance threshold.`);
+    }
+  } else {
+    review.push("No therapy duration could be calculated from the selected files.");
+  }
+
+  if (Number.isFinite(ahi)) {
+    if (ahi < 5) positives.push(`AHI was ${compact(ahi, 2)}/hr, within the commonly used treated target range.`);
+    else if (ahi < 10) review.push(`AHI was ${compact(ahi, 2)}/hr, above the commonly used treated target range.`);
+    else review.push(`AHI was ${compact(ahi, 2)}/hr, which is high enough to review with the detailed charts.`);
+  } else {
+    signalWarnings.push("AHI could not be calculated from this selection.");
+  }
+
+  if (Number.isFinite(leak95LMin)) {
+    if (leak95LMin >= LEAK_REVIEW_L_MIN) {
+      review.push(`95% leak was ${compact(leakDisplay, 1)} ${leakUnitLabel(prefs)}, above the ${LEAK_REVIEW_L_MIN} L/min review line.`);
+    } else {
+      positives.push(`95% leak was ${compact(leakDisplay, 1)} ${leakUnitLabel(prefs)}, below the ${LEAK_REVIEW_L_MIN} L/min review line.`);
+    }
+  } else {
+    signalWarnings.push("Leak data was not available.");
+  }
+
+  if (!Number.isFinite(pressure95)) signalWarnings.push("Pressure statistics were not available.");
+  if (!session.series.flow.length) signalWarnings.push("Raw breath flow is not loaded or not available.");
+  if (!session.series.spo2.length) signalWarnings.push("No valid SpO2 samples were found.");
+  if (session.eventClusters?.length) {
+    review.push(`${session.eventClusters.length} event cluster${session.eventClusters.length === 1 ? "" : "s"} found; inspect the cluster panel and event focus chart.`);
+  }
+
+  const headline = [
+    therapySeconds > 0 ? `Used for ${durationLabel(therapySeconds)}` : "Usage unavailable",
+    Number.isFinite(ahi) ? `AHI ${compact(ahi, 2)}/hr` : "AHI unavailable",
+    Number.isFinite(leak95LMin) ? `95% leak ${compact(leakDisplay, 1)} ${leakUnitLabel(prefs)}` : "leak unavailable",
+    review.length ? `${review.length} item${review.length === 1 ? "" : "s"} to review` : "no major review flags",
+  ].join(". ");
+
+  return {
+    headline,
+    positives,
+    review,
+    signalWarnings,
+    metrics: {
+      therapySeconds,
+      ahi,
+      pressure95,
+      pressureMedian,
+      leak95LMin,
+      leakDisplay,
+      eventCounts: session.eventCounts,
+    },
+  };
 }
 
 function datalogGroupKey(file) {
@@ -988,7 +1187,67 @@ function ChartTooltip({ active, payload, label }) {
   );
 }
 
-function TimelineChart({ session, prefs }) {
+function timeInRange(value, range) {
+  if (!range) return true;
+  return value >= range.start && value <= range.end;
+}
+
+function filterChartData(data, range, key = "time") {
+  if (!range) return data;
+  return data.filter((point) => timeInRange(point[key], range));
+}
+
+function chartRangeLabel(range) {
+  if (!range) return "Full night";
+  return `${timeLabel(range.start)} to ${timeLabel(range.end)}`;
+}
+
+function moveRange(range, fullEnd, delta) {
+  const span = Math.max(60, range.end - range.start);
+  const start = clamp(range.start + delta, 0, Math.max(0, fullEnd - span));
+  return { start, end: Math.min(fullEnd, start + span) };
+}
+
+function zoomRange(range, fullEnd, factor) {
+  const center = (range.start + range.end) / 2;
+  const currentSpan = Math.max(60, range.end - range.start);
+  const span = clamp(currentSpan * factor, 60, Math.max(60, fullEnd));
+  const start = clamp(center - span / 2, 0, Math.max(0, fullEnd - span));
+  return { start, end: Math.min(fullEnd, start + span) };
+}
+
+function ChartControls({ range, fullEnd, onChange }) {
+  if (!range || fullEnd <= 60) return null;
+  const span = range.end - range.start;
+  const panStep = Math.max(60, span * 0.35);
+  return (
+    <div className="chart-controls">
+      <div className="range-readout">
+        <Search size={14} />
+        <span>{chartRangeLabel(range)}</span>
+      </div>
+      <div className="chart-control-buttons">
+        <button type="button" className="icon-button" aria-label="Pan left" title="Pan left" onClick={() => onChange(moveRange(range, fullEnd, -panStep))}>
+          <ArrowLeft size={15} />
+        </button>
+        <button type="button" className="icon-button" aria-label="Zoom in" title="Zoom in" onClick={() => onChange(zoomRange(range, fullEnd, 0.5))}>
+          <ZoomIn size={15} />
+        </button>
+        <button type="button" className="icon-button" aria-label="Zoom out" title="Zoom out" onClick={() => onChange(zoomRange(range, fullEnd, 2))}>
+          <ZoomOut size={15} />
+        </button>
+        <button type="button" className="icon-button" aria-label="Pan right" title="Pan right" onClick={() => onChange(moveRange(range, fullEnd, panStep))}>
+          <ArrowRight size={15} />
+        </button>
+        <button type="button" className="secondary-button inline-action" onClick={() => onChange({ start: 0, end: fullEnd })}>
+          Reset
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function TimelineChart({ session, prefs, range, crosshairTime, onCrosshair }) {
   const chartData = useMemo(
     () =>
       mergeSeries(session.series.pressure, [
@@ -998,11 +1257,26 @@ function TimelineChart({ session, prefs }) {
       ]),
     [session, prefs]
   );
-  const eventMarkers = session.events.slice(0, 80);
+  const rangedData = filterChartData(chartData, range);
+  const eventMarkers = session.events.filter((event) => timeInRange(event.onset, range)).slice(0, 80);
+  const clusters = (session.eventClusters || []).filter((cluster) => cluster.end >= range.start && cluster.start <= range.end);
+  const gaps = session.gaps.filter((gap) => gap.end >= range.start && gap.start <= range.end);
+  const segments = session.segments.filter((segment) => segment.start >= range.start && segment.start <= range.end);
+  if (!rangedData.length) return <EmptyState label="No pressure, leak, or respiration samples in the selected range." />;
 
   return (
     <ResponsiveContainer width="100%" height={280}>
-      <ComposedChart data={chartData} margin={{ top: 10, right: 22, left: -8, bottom: 4 }}>
+      <ComposedChart
+        data={rangedData}
+        syncId="session-charts"
+        syncMethod="value"
+        margin={{ top: 10, right: 22, left: -8, bottom: 4 }}
+        onMouseMove={(state) => {
+          const time = state?.activePayload?.[0]?.payload?.time;
+          if (Number.isFinite(time)) onCrosshair?.(time);
+        }}
+        onMouseLeave={() => onCrosshair?.(null)}
+      >
         <CartesianGrid stroke={COLORS.grid} vertical={false} />
         <XAxis
           dataKey="label"
@@ -1026,18 +1300,31 @@ function TimelineChart({ session, prefs }) {
           tickLine={false}
           width={38}
         />
-        <Tooltip content={<ChartTooltip />} />
-        {session.gaps.map((gap, index) => (
+        <Tooltip cursor={{ stroke: COLORS.text, strokeOpacity: 0.18 }} content={<ChartTooltip />} />
+        {Number.isFinite(crosshairTime) && timeInRange(crosshairTime, range) ? (
+          <ReferenceLine x={timeLabel(crosshairTime)} yAxisId="left" stroke={COLORS.text} strokeOpacity={0.28} />
+        ) : null}
+        {clusters.map((cluster) => (
+          <ReferenceArea
+            key={`cluster-${cluster.id}`}
+            x1={timeLabel(cluster.start)}
+            x2={timeLabel(cluster.end)}
+            yAxisId="left"
+            fill={COLORS.amber}
+            fillOpacity={0.08}
+          />
+        ))}
+        {gaps.map((gap, index) => (
           <ReferenceArea
             key={`gap-${index}`}
-            x1={gap.startLabel}
-            x2={gap.endLabel}
+            x1={timeLabel(Math.max(gap.start, range.start))}
+            x2={timeLabel(Math.min(gap.end, range.end))}
             fill={COLORS.coral}
             fillOpacity={0.08}
             yAxisId="left"
           />
         ))}
-        {session.segments.map((segment, index) => (
+        {segments.map((segment, index) => (
           <ReferenceLine
             key={`segment-${segment.type}-${index}`}
             x={segment.startLabel}
@@ -1091,8 +1378,8 @@ function TimelineChart({ session, prefs }) {
   );
 }
 
-function FlowChart({ session, canLoadFlow, flowLoading, onLoadFlow }) {
-  const data = session.series.flow.map((point) => ({ ...point, flow: point.value }));
+function FlowChart({ session, canLoadFlow, flowLoading, onLoadFlow, range, crosshairTime, onCrosshair }) {
+  const data = filterChartData(session.series.flow, range).map((point) => ({ ...point, flow: point.value }));
   if (!data.length) {
     return (
       <EmptyState label={canLoadFlow ? "BRP waveform data is available but not loaded yet." : "No BRP flow signal was loaded."}>
@@ -1105,11 +1392,12 @@ function FlowChart({ session, canLoadFlow, flowLoading, onLoadFlow }) {
     );
   }
 
-  return <CanvasWaveform data={data} />;
+  return <CanvasWaveform data={data} range={range} crosshairTime={crosshairTime} onCrosshair={onCrosshair} />;
 }
 
-function CanvasWaveform({ data }) {
+function CanvasWaveform({ data, range, crosshairTime, onCrosshair }) {
   const canvasRef = useRef(null);
+  const layoutRef = useRef(null);
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -1141,9 +1429,13 @@ function CanvasWaveform({ data }) {
     const bottomPad = 34;
     const plotWidth = Math.max(1, width - leftPad - rightPad);
     const plotHeight = Math.max(1, height - topPad - bottomPad);
-    const range = Math.max(0.1, max - min);
-    const xFor = (index) => leftPad + (index / Math.max(1, data.length - 1)) * plotWidth;
-    const yFor = (value) => topPad + (1 - (value - min) / range) * plotHeight;
+    const valueRange = Math.max(0.1, max - min);
+    const domainStart = Number.isFinite(range?.start) ? range.start : data[0]?.time || 0;
+    const domainEnd = Number.isFinite(range?.end) ? range.end : data[data.length - 1]?.time || domainStart + 1;
+    const domainSpan = Math.max(1, domainEnd - domainStart);
+    const xForTime = (time) => leftPad + ((time - domainStart) / domainSpan) * plotWidth;
+    const yFor = (value) => topPad + (1 - (value - min) / valueRange) * plotHeight;
+    layoutRef.current = { leftPad, rightPad, width, domainStart, domainEnd, domainSpan };
 
     ctx.strokeStyle = COLORS.grid;
     ctx.lineWidth = 1;
@@ -1159,12 +1451,25 @@ function CanvasWaveform({ data }) {
     ctx.lineWidth = 1.4;
     ctx.beginPath();
     data.forEach((point, index) => {
-      const x = xFor(index);
+      const x = xForTime(point.time);
       const y = yFor(point.flow);
       if (index === 0) ctx.moveTo(x, y);
       else ctx.lineTo(x, y);
     });
     ctx.stroke();
+
+    if (Number.isFinite(crosshairTime) && crosshairTime >= domainStart && crosshairTime <= domainEnd) {
+      const x = xForTime(crosshairTime);
+      ctx.strokeStyle = "rgba(237, 242, 247, 0.32)";
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(x, topPad);
+      ctx.lineTo(x, topPad + plotHeight);
+      ctx.stroke();
+      ctx.fillStyle = COLORS.text;
+      ctx.textAlign = x < width - 120 ? "left" : "right";
+      ctx.fillText(timeLabel(crosshairTime), x < width - 120 ? x + 6 : x - 6, topPad + 12);
+    }
 
     ctx.fillStyle = COLORS.muted;
     ctx.textAlign = "left";
@@ -1175,16 +1480,30 @@ function CanvasWaveform({ data }) {
     ctx.fillText(data[0]?.label || "00:00:00", leftPad, height - 8);
     ctx.textAlign = "right";
     ctx.fillText(data[data.length - 1]?.label || "", width - rightPad, height - 8);
-  }, [data]);
+  }, [data, range, crosshairTime]);
+
+  function handleMouseMove(event) {
+    const layout = layoutRef.current;
+    if (!layout) return;
+    const rect = event.currentTarget.getBoundingClientRect();
+    const x = clamp(event.clientX - rect.left, layout.leftPad, layout.width - layout.rightPad);
+    const ratio = (x - layout.leftPad) / Math.max(1, layout.width - layout.leftPad - layout.rightPad);
+    onCrosshair?.(layout.domainStart + ratio * layout.domainSpan);
+  }
 
   return (
     <div className="canvas-wrap">
-      <canvas ref={canvasRef} aria-label="Flow waveform" />
+      <canvas
+        ref={canvasRef}
+        aria-label="Flow waveform"
+        onMouseMove={handleMouseMove}
+        onMouseLeave={() => onCrosshair?.(null)}
+      />
     </div>
   );
 }
 
-function OximetryChart({ session }) {
+function OximetryChart({ session, range, crosshairTime, onCrosshair }) {
   const data = useMemo(
     () =>
       mergeSeries(session.series.spo2, [
@@ -1193,11 +1512,23 @@ function OximetryChart({ session }) {
       ]),
     [session]
   );
+  const rangedData = filterChartData(data, range);
   if (!data.length) return <EmptyState label="No valid SAD oximetry samples were found." />;
+  if (!rangedData.length) return <EmptyState label="No valid oximetry samples in the selected range." />;
 
   return (
     <ResponsiveContainer width="100%" height={220}>
-      <ComposedChart data={data} margin={{ top: 8, right: 22, left: -8, bottom: 0 }}>
+      <ComposedChart
+        data={rangedData}
+        syncId="session-charts"
+        syncMethod="value"
+        margin={{ top: 8, right: 22, left: -8, bottom: 0 }}
+        onMouseMove={(state) => {
+          const time = state?.activePayload?.[0]?.payload?.time;
+          if (Number.isFinite(time)) onCrosshair?.(time);
+        }}
+        onMouseLeave={() => onCrosshair?.(null)}
+      >
         <CartesianGrid stroke={COLORS.grid} vertical={false} />
         <XAxis
           dataKey="label"
@@ -1222,7 +1553,10 @@ function OximetryChart({ session }) {
           tickLine={false}
           width={38}
         />
-        <Tooltip content={<ChartTooltip />} />
+        <Tooltip cursor={{ stroke: COLORS.text, strokeOpacity: 0.18 }} content={<ChartTooltip />} />
+        {Number.isFinite(crosshairTime) && timeInRange(crosshairTime, range) ? (
+          <ReferenceLine x={timeLabel(crosshairTime)} yAxisId="left" stroke={COLORS.text} strokeOpacity={0.28} />
+        ) : null}
         <Line yAxisId="left" type="monotone" dataKey="spo2" name="SpO2 %" stroke={COLORS.teal} strokeWidth={1.8} dot={false} />
         <Line yAxisId="right" type="monotone" dataKey="pulse" name="Pulse bpm" stroke={COLORS.coral} strokeWidth={1.5} dot={false} />
       </ComposedChart>
@@ -1232,8 +1566,9 @@ function OximetryChart({ session }) {
 
 function EventDetailPanel({ event, session, onClear, prefs, canLoadFlow, flowLoading, onLoadFlow }) {
   if (!event) return <EmptyState label="Select an event row to inspect a focused pressure/leak window." />;
-  const start = Math.max(0, event.onset - 60);
-  const end = event.onset + Math.max(60, event.duration + 60);
+  const start = Math.max(0, event.onset - EVENT_FOCUS_PAD_SECONDS);
+  const end = event.onset + EVENT_FOCUS_PAD_SECONDS;
+  const focusRange = { start, end };
   const pressure = session.series.pressure.filter((point) => point.time >= start && point.time <= end);
   const leak = session.series.leak
     .filter((point) => point.time >= start && point.time <= end)
@@ -1251,7 +1586,7 @@ function EventDetailPanel({ event, session, onClear, prefs, canLoadFlow, flowLoa
       <div className="event-detail-head">
         <div>
           <strong>{event.label}</strong>
-          <span>{event.time} · {compact(event.duration, 0)}s</span>
+          <span>{event.time} · {compact(event.duration, 0)}s · {durationLabel(end - start)} focus</span>
         </div>
         <button type="button" className="secondary-button inline-action" onClick={onClear}>Clear</button>
       </div>
@@ -1269,10 +1604,10 @@ function EventDetailPanel({ event, session, onClear, prefs, canLoadFlow, flowLoa
       </ResponsiveContainer>
       {flow.length ? (
         <div className="event-waveform">
-          <CanvasWaveform data={flow} />
+          <CanvasWaveform data={flow} range={focusRange} />
         </div>
       ) : canLoadFlow ? (
-        <EmptyState label="Raw BRP waveform is available for this event but not loaded.">
+        <EmptyState label={flowLoading ? "Loading raw BRP flow for this event..." : "Raw BRP waveform is available for this event."}>
           <button type="button" className="secondary-button inline-action" onClick={onLoadFlow} disabled={flowLoading}>
             {flowLoading ? "Loading flow..." : "Load raw event flow"}
           </button>
@@ -1282,25 +1617,33 @@ function EventDetailPanel({ event, session, onClear, prefs, canLoadFlow, flowLoa
   );
 }
 
-function EventsChart({ session }) {
-  const data = session.events.map((event) => ({
+function EventsChart({ session, range, crosshairTime, onCrosshair }) {
+  const data = session.events.filter((event) => timeInRange(event.onset, range)).map((event) => ({
     ...event,
     y: 1,
     color: /central/i.test(event.label) ? COLORS.amber : /obstructive/i.test(event.label) ? COLORS.coral : COLORS.blue,
   }));
-  if (!data.length) return <EmptyState label="No scored respiratory events were found." />;
-  const eventStart = Math.min(...data.map((event) => event.onset));
-  const eventEnd = Math.max(...data.map((event) => event.onset));
-  const eventSpan = Math.max(1, eventEnd - eventStart);
-  const axisPadding = Math.max(60, eventSpan * 0.06);
+  if (!session.events.length) return <EmptyState label="No scored respiratory events were found." />;
+  if (!data.length) return <EmptyState label="No scored events in the selected range." />;
+  const domainStart = range?.start ?? Math.min(...data.map((event) => event.onset));
+  const domainEnd = range?.end ?? Math.max(...data.map((event) => event.onset));
+  const clusters = (session.eventClusters || []).filter((cluster) => cluster.end >= domainStart && cluster.start <= domainEnd);
 
   return (
     <ResponsiveContainer width="100%" height={130}>
-      <ComposedChart data={data} margin={{ top: 10, right: 30, left: 8, bottom: 0 }}>
+      <ComposedChart
+        data={data}
+        margin={{ top: 10, right: 30, left: 8, bottom: 0 }}
+        onMouseMove={(state) => {
+          const onset = state?.activePayload?.[0]?.payload?.onset;
+          if (Number.isFinite(onset)) onCrosshair?.(onset);
+        }}
+        onMouseLeave={() => onCrosshair?.(null)}
+      >
         <XAxis
           type="number"
           dataKey="onset"
-          domain={[eventStart - axisPadding, eventEnd + axisPadding]}
+          domain={[domainStart, domainEnd]}
           minTickGap={34}
           tickFormatter={timeLabel}
           tick={{ fill: COLORS.faint, fontSize: 11 }}
@@ -1310,6 +1653,7 @@ function EventsChart({ session }) {
         />
         <YAxis hide domain={[0, 1.4]} />
         <Tooltip
+          cursor={{ stroke: COLORS.text, strokeOpacity: 0.18 }}
           content={({ active, payload }) => {
             if (!active || !payload?.length) return null;
             const event = payload[0].payload;
@@ -1324,6 +1668,18 @@ function EventsChart({ session }) {
             );
           }}
         />
+        {clusters.map((cluster) => (
+          <ReferenceArea
+            key={`event-cluster-${cluster.id}`}
+            x1={cluster.start}
+            x2={cluster.end}
+            fill={COLORS.amber}
+            fillOpacity={0.08}
+          />
+        ))}
+        {Number.isFinite(crosshairTime) && timeInRange(crosshairTime, range) ? (
+          <ReferenceLine x={crosshairTime} stroke={COLORS.text} strokeOpacity={0.28} />
+        ) : null}
         <Scatter dataKey="y" name="Events">
           {data.map((event, index) => (
             <Cell key={`${event.onset}-${index}`} fill={event.color} />
@@ -1387,6 +1743,247 @@ function toCsv(rows) {
   if (!rows.length) return "";
   const headers = Object.keys(rows[0]);
   return [headers.join(","), ...rows.map((row) => headers.map((header) => csvCell(row[header])).join(","))].join("\n");
+}
+
+function sanitizeReportText(value) {
+  return String(value ?? "")
+    .replace(/[^\x09\x0a\x0d\x20-\x7e]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function pdfEscape(value) {
+  return sanitizeReportText(value).replace(/\\/g, "\\\\").replace(/\(/g, "\\(").replace(/\)/g, "\\)");
+}
+
+function wrapReportLine(text, maxChars = 88) {
+  const clean = sanitizeReportText(text);
+  if (!clean) return [""];
+  const words = clean.split(" ");
+  const lines = [];
+  let line = "";
+  words.forEach((word) => {
+    if (!line) {
+      line = word;
+      return;
+    }
+    if (`${line} ${word}`.length > maxChars) {
+      lines.push(line);
+      line = word;
+      return;
+    }
+    line = `${line} ${word}`;
+  });
+  if (line) lines.push(line);
+  return lines;
+}
+
+function flattenPdfSections(title, sections) {
+  const lines = [title, `Generated ${new Date().toISOString().slice(0, 16).replace("T", " ")}`, ""];
+  sections.forEach((section) => {
+    lines.push(section.title.toUpperCase());
+    (section.lines || []).forEach((line) => {
+      wrapReportLine(line).forEach((wrapped) => lines.push(wrapped));
+    });
+    lines.push("");
+  });
+  return lines;
+}
+
+function downloadPdfFromSections(fileName, title, sections) {
+  const rawLines = flattenPdfSections(title, sections);
+  const linesPerPage = 48;
+  const pages = [];
+  for (let i = 0; i < rawLines.length; i += linesPerPage) {
+    pages.push(rawLines.slice(i, i + linesPerPage));
+  }
+
+  const objects = new Map();
+  const kids = [];
+  const fontObjectId = 3;
+  let nextObjectId = 4;
+
+  objects.set(1, "<< /Type /Catalog /Pages 2 0 R >>");
+  objects.set(fontObjectId, "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>");
+
+  pages.forEach((pageLines) => {
+    const pageObjectId = nextObjectId;
+    const contentObjectId = nextObjectId + 1;
+    nextObjectId += 2;
+    kids.push(`${pageObjectId} 0 R`);
+    const content = [
+      "BT",
+      "/F1 11 Tf",
+      "14 TL",
+      "40 752 Td",
+      ...pageLines.map((line) => `(${pdfEscape(line)}) Tj T*`),
+      "ET",
+    ].join("\n");
+    objects.set(
+      pageObjectId,
+      `<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 ${fontObjectId} 0 R >> >> /Contents ${contentObjectId} 0 R >>`
+    );
+    objects.set(contentObjectId, `<< /Length ${content.length} >>\nstream\n${content}\nendstream`);
+  });
+
+  objects.set(2, `<< /Type /Pages /Kids [${kids.join(" ")}] /Count ${pages.length} >>`);
+
+  const maxObjectId = nextObjectId - 1;
+  let pdf = "%PDF-1.4\n";
+  const offsets = Array(maxObjectId + 1).fill(0);
+  for (let id = 1; id <= maxObjectId; id += 1) {
+    offsets[id] = pdf.length;
+    pdf += `${id} 0 obj\n${objects.get(id)}\nendobj\n`;
+  }
+  const xrefStart = pdf.length;
+  pdf += `xref\n0 ${maxObjectId + 1}\n0000000000 65535 f \n`;
+  for (let id = 1; id <= maxObjectId; id += 1) {
+    pdf += `${String(offsets[id]).padStart(10, "0")} 00000 n \n`;
+  }
+  pdf += `trailer\n<< /Size ${maxObjectId + 1} /Root 1 0 R >>\nstartxref\n${xrefStart}\n%%EOF`;
+  downloadText(fileName, pdf, "application/pdf");
+}
+
+function reportDateSlug(value) {
+  return (value || "report").replace(/[^0-9A-Za-z-]+/g, "-");
+}
+
+function complianceRowsForExport(compliance, prefs) {
+  return compliance.rows.map((row) => ({
+    date: row.date,
+    usage: Number.isFinite(row.usageMinutes) ? durationLabel(row.usageMinutes * 60) : "--",
+    compliant: Number.isFinite(row.usageMinutes) && row.usageMinutes >= COMPLIANCE_MINUTES ? "yes" : "no",
+    ahi: compact(row.ahi, 2),
+    leak_95: `${compact(leakFromLmin(row.leak95LMin, prefs), 1)} ${leakUnitLabel(prefs)}`,
+    pressure_95: `${compact(row.pressure95, 1)} cmH2O`,
+    mask_windows: maskWindowSummary(row.maskWindows),
+  }));
+}
+
+function clusterRowsForExport(clusters, prefs) {
+  return clusters.map((cluster) => ({
+    cluster: cluster.id,
+    start: cluster.startLabel,
+    end: cluster.endLabel,
+    duration: durationLabel(cluster.duration),
+    events: cluster.count,
+    rate_per_hr: compact(cluster.rate, 1),
+    event_mix: cluster.typeSummary,
+    avg_pressure: `${compact(cluster.avgPressure, 1)} cmH2O`,
+    avg_leak: `${compact(leakFromLps(cluster.avgLeak, prefs), 1)} ${leakUnitLabel(prefs)}`,
+  }));
+}
+
+function buildCompliancePdfSections(compliance, prefs) {
+  return [
+    {
+      title: "30-Night Compliance",
+      lines: [
+        `Date range: ${compliance.startDate || "--"} to ${compliance.endDate || "--"}`,
+        `Nights with usage: ${compliance.nightsWithUsage}/${compliance.nights}`,
+        `Nights >= 4 hours: ${compliance.compliantNights}/${compliance.nightsWithUsage}`,
+        `Compliance: ${compact(compliance.percent, 1)}%`,
+        `Average usage: ${compact(compliance.avgUsageHours, 2)} hr/night`,
+        `Average AHI: ${compact(compliance.avgAhi, 2)}/hr`,
+        `Average leak 95%: ${compact(leakFromLmin(compliance.avgLeak95LMin, prefs), 1)} ${leakUnitLabel(prefs)}`,
+        `Average pressure 95%: ${compact(compliance.avgPressure95, 1)} cmH2O`,
+      ],
+    },
+    {
+      title: "Daily Rows",
+      lines: complianceRowsForExport(compliance, prefs).map(
+        (row) => `${row.date}: usage ${row.usage}, compliant ${row.compliant}, AHI ${row.ahi}, leak ${row.leak_95}, pressure ${row.pressure_95}`
+      ),
+    },
+  ];
+}
+
+function buildDoctorReportSections({ session, summary, compliance, prefs, selectedSections }) {
+  const sections = [
+    {
+      title: "Sleep Summary",
+      lines: [
+        summary.headline,
+        ...summary.positives.map((item) => `OK: ${item}`),
+        ...(summary.review.length ? summary.review.map((item) => `Review: ${item}`) : ["Review: no major review flags from the rule-based checks."]),
+        ...summary.signalWarnings.map((item) => `Signal note: ${item}`),
+      ],
+    },
+    {
+      title: "Key Metrics",
+      lines: [
+        `Date: ${session.date || "unknown"}`,
+        `Therapy time: ${durationLabel(summary.metrics.therapySeconds)}`,
+        `AHI: ${compact(summary.metrics.ahi, 2)}/hr`,
+        `Pressure 95%: ${compact(summary.metrics.pressure95, 1)} cmH2O`,
+        `Pressure median: ${compact(summary.metrics.pressureMedian, 1)} cmH2O`,
+        `Leak 95%: ${compact(summary.metrics.leakDisplay, 1)} ${leakUnitLabel(prefs)}`,
+        `Events: central ${session.eventCounts.central}, obstructive ${session.eventCounts.obstructive}, hypopnea ${session.eventCounts.hypopnea}`,
+      ],
+    },
+  ];
+
+  if (selectedSections.events) {
+    sections.push({
+      title: "Event Breakdown",
+      lines: [
+        `Total annotations: ${session.eventCounts.all}`,
+        `Central apnea: ${session.eventCounts.central}`,
+        `Obstructive apnea: ${session.eventCounts.obstructive}`,
+        `Hypopnea: ${session.eventCounts.hypopnea}`,
+      ],
+    });
+  }
+
+  if (selectedSections.clusters) {
+    sections.push({
+      title: "Event Clusters",
+      lines: session.eventClusters?.length
+        ? clusterRowsForExport(session.eventClusters, prefs).map(
+            (row) => `Cluster ${row.cluster}: ${row.start}-${row.end}, ${row.events} events, ${row.rate_per_hr}/hr, ${row.event_mix}`
+          )
+        : ["No event clusters found using the current spacing rule."],
+    });
+  }
+
+  if (selectedSections.timeline) {
+    sections.push({
+      title: "Therapy Timeline Chart Notes",
+      lines: [
+        `Pressure samples: ${session.series.pressure.length.toLocaleString()}`,
+        `Leak samples: ${session.series.leak.length.toLocaleString()}`,
+        `Respiration samples: ${session.series.respiration.length.toLocaleString()}`,
+        `Gaps detected: ${session.gaps.length}`,
+      ],
+    });
+  }
+
+  if (selectedSections.flow) {
+    sections.push({
+      title: "Breath Flow Chart Notes",
+      lines: [
+        `Flow samples shown: ${session.series.flow.length.toLocaleString()}`,
+        `Flow range: ${compact(session.stats.flowMinMax.min, 2)} to ${compact(session.stats.flowMinMax.max, 2)} L/s`,
+      ],
+    });
+  }
+
+  if (selectedSections.oximetry) {
+    sections.push({
+      title: "Oximetry Chart Notes",
+      lines: [
+        `SpO2 median: ${compact(session.stats.spo2Median, 1)}%`,
+        `SpO2 low percentile: ${compact(session.stats.spo2Low, 1)}%`,
+        `Pulse median: ${compact(session.stats.pulseMedian, 1)} bpm`,
+      ],
+    });
+  }
+
+  if (selectedSections.compliance && compliance.rows.length) {
+    sections.push(...buildCompliancePdfSections(compliance, prefs));
+  }
+
+  return sections;
 }
 
 function ExportButtons({ baseName, rows }) {
@@ -1618,6 +2215,233 @@ function EmptyState({ label, children }) {
   );
 }
 
+function SleepSummaryPanel({ summary }) {
+  return (
+    <Panel title="Sleep summary" note="rule-based local analysis">
+      <div className="summary-lead">
+        <FileText size={18} />
+        <strong>{summary.headline}</strong>
+      </div>
+      <div className="summary-columns">
+        <div>
+          <h3>Looks okay</h3>
+          {summary.positives.length ? (
+            summary.positives.map((item) => <p key={item}>{item}</p>)
+          ) : (
+            <p>No positive flags could be generated from the loaded signals.</p>
+          )}
+        </div>
+        <div>
+          <h3>Review</h3>
+          {summary.review.length ? (
+            summary.review.map((item) => <p key={item}>{item}</p>)
+          ) : (
+            <p>No major review flags from the current rule set.</p>
+          )}
+        </div>
+        <div>
+          <h3>Signal notes</h3>
+          {summary.signalWarnings.length ? (
+            summary.signalWarnings.map((item) => <p key={item}>{item}</p>)
+          ) : (
+            <p>Core pressure, leak, event, and flow signals are available.</p>
+          )}
+        </div>
+      </div>
+    </Panel>
+  );
+}
+
+function ComplianceReportPanel({ compliance, prefs }) {
+  if (!compliance.rows.length) {
+    return (
+      <Panel title="30-night compliance" note="STR summary required">
+        <EmptyState label="No STR daily summary records were loaded." />
+      </Panel>
+    );
+  }
+  const rows = complianceRowsForExport(compliance, prefs);
+  return (
+    <Panel title="30-night compliance" note={`${compliance.startDate} to ${compliance.endDate}`}>
+      <div className="report-actions">
+        <button
+          type="button"
+          className="secondary-button"
+          onClick={() => downloadPdfFromSections(
+            `cpap-compliance-${reportDateSlug(compliance.endDate)}.pdf`,
+            "CPAP 30-Night Compliance Report",
+            buildCompliancePdfSections(compliance, prefs)
+          )}
+        >
+          <Download size={15} />
+          PDF
+        </button>
+      </div>
+      <div className="overview-grid compliance-grid">
+        <div>
+          <span>Nights used</span>
+          <strong>{compliance.nightsWithUsage}/{compliance.nights}</strong>
+        </div>
+        <div>
+          <span>Over 4 hours</span>
+          <strong>{compliance.compliantNights}</strong>
+        </div>
+        <div>
+          <span>Compliance</span>
+          <strong>{compact(compliance.percent, 1)}%</strong>
+        </div>
+        <div>
+          <span>Avg usage</span>
+          <strong>{compact(compliance.avgUsageHours, 2)}h</strong>
+        </div>
+      </div>
+      <ExportButtons baseName="cpap-30-night-compliance" rows={rows} />
+      <VirtualTable
+        rows={rows}
+        maxHeight={240}
+        rowKey={(row) => row.date}
+        columns={[
+          { key: "date", header: "Date" },
+          { key: "usage", header: "Usage" },
+          { key: "compliant", header: ">= 4h" },
+          { key: "ahi", header: "AHI" },
+          { key: "leak_95", header: "Leak 95" },
+          { key: "pressure_95", header: "Pressure 95" },
+        ]}
+      />
+    </Panel>
+  );
+}
+
+function EventClustersPanel({ clusters, prefs, onSelectEvent }) {
+  if (!clusters?.length) {
+    return (
+      <Panel title="Clusters" note="3+ respiratory events within 3 minutes">
+        <EmptyState label="No event clusters found in the selected session." />
+      </Panel>
+    );
+  }
+  const rows = clusterRowsForExport(clusters, prefs);
+  return (
+    <Panel title="Clusters" note={`${clusters.length} cluster${clusters.length === 1 ? "" : "s"} found`}>
+      <VirtualTable
+        rows={clusters}
+        maxHeight={220}
+        rowKey={(cluster) => cluster.id}
+        onRowClick={(cluster) => onSelectEvent?.(cluster.events[0])}
+        columns={[
+          { key: "id", header: "#" },
+          { key: "start", header: "Start", render: (cluster) => cluster.startLabel },
+          { key: "end", header: "End", render: (cluster) => cluster.endLabel },
+          { key: "duration", header: "Duration", render: (cluster) => durationLabel(cluster.duration) },
+          { key: "events", header: "Events", render: (cluster) => cluster.count },
+          { key: "rate", header: "Rate", render: (cluster) => `${compact(cluster.rate, 1)}/hr` },
+          { key: "mix", header: "Mix", render: (cluster) => cluster.typeSummary },
+        ]}
+      />
+      <ExportButtons baseName="cpap-event-clusters" rows={rows} />
+    </Panel>
+  );
+}
+
+function htmlEscape(value) {
+  return String(value ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+function openPrintableReport(title, sections) {
+  const body = sections.map((section) => `
+    <section>
+      <h2>${htmlEscape(section.title)}</h2>
+      ${(section.lines || []).map((line) => `<p>${htmlEscape(line)}</p>`).join("")}
+    </section>
+  `).join("");
+  const html = `<!doctype html>
+    <html>
+      <head>
+        <meta charset="utf-8" />
+        <title>${htmlEscape(title)}</title>
+        <style>
+          body { font: 12px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 34px; color: #111827; }
+          h1 { font-size: 22px; margin: 0 0 16px; }
+          h2 { font-size: 14px; margin: 22px 0 8px; border-bottom: 1px solid #d1d5db; padding-bottom: 4px; }
+          p { margin: 4px 0; line-height: 1.35; }
+          @media print { button { display: none; } }
+        </style>
+      </head>
+      <body>
+        <button onclick="window.print()">Print / Save PDF</button>
+        <h1>${htmlEscape(title)}</h1>
+        ${body}
+      </body>
+    </html>`;
+  const win = window.open("", "_blank");
+  if (!win) {
+    downloadText(`${reportDateSlug(title)}.html`, html, "text/html");
+    return;
+  }
+  win.document.write(html);
+  win.document.close();
+  win.focus();
+}
+
+function ReportActionsPanel({ session, summary, compliance, prefs }) {
+  const [selectedSections, setSelectedSections] = useState({
+    timeline: true,
+    events: true,
+    flow: true,
+    oximetry: true,
+    clusters: true,
+    compliance: true,
+  });
+  const sections = buildDoctorReportSections({ session, summary, compliance, prefs, selectedSections });
+  const toggle = (key) => setSelectedSections((current) => ({ ...current, [key]: !current[key] }));
+  return (
+    <Panel title="Doctor report" note="PDF and printable summary">
+      <div className="report-checks">
+        {Object.entries({
+          timeline: "Timeline",
+          events: "Events",
+          flow: "Flow",
+          oximetry: "Oximetry",
+          clusters: "Clusters",
+          compliance: "Compliance",
+        }).map(([key, label]) => (
+          <label key={key}>
+            <input type="checkbox" checked={selectedSections[key]} onChange={() => toggle(key)} />
+            <span>{label}</span>
+          </label>
+        ))}
+      </div>
+      <div className="report-actions">
+        <button
+          type="button"
+          className="secondary-button"
+          onClick={() => downloadPdfFromSections(
+            `cpap-doctor-report-${reportDateSlug(session.date)}.pdf`,
+            "CPAP Doctor Report",
+            sections
+          )}
+        >
+          <Download size={15} />
+          PDF
+        </button>
+        <button type="button" className="secondary-button" onClick={() => openPrintableReport("CPAP Doctor Report", sections)}>
+          <Printer size={15} />
+          Print
+        </button>
+      </div>
+      <div className="note-box">
+        <BarChart3 size={16} />
+        Chart selections add text summaries of the current charts to the report. The interactive charts remain in the dashboard.
+      </div>
+    </Panel>
+  );
+}
+
 function PreferencesPanel({ prefs, onChange }) {
   return (
     <Panel title="Preferences" note="stored in this browser">
@@ -1793,6 +2617,14 @@ function ExportOverview({
   );
 }
 
+function sessionFullChartEnd(session) {
+  const seriesEnds = Object.values(session.series || {}).map((series) => series?.[series.length - 1]?.time || 0);
+  const eventEnd = session.events?.length
+    ? Math.max(...session.events.map((event) => event.onset + event.duration))
+    : 0;
+  return Math.max(60, session.therapySeconds || 0, eventEnd, ...seriesEnds);
+}
+
 function Dashboard({ parsed, diagnostics, onReset }) {
   const dailyRows = useMemo(() => buildDailyRows(parsed), [parsed]);
   const groups = useMemo(() => buildTherapyGroups(parsed, dailyRows), [parsed, dailyRows]);
@@ -1802,6 +2634,9 @@ function Dashboard({ parsed, diagnostics, onReset }) {
   const [detailLoading, setDetailLoading] = useState(false);
   const [flowLoading, setFlowLoading] = useState(false);
   const [selectedEvent, setSelectedEvent] = useState(null);
+  const [chartRange, setChartRange] = useState({ start: 0, end: 60 });
+  const [crosshairTime, setCrosshairTime] = useState(null);
+  const autoFlowKeyRef = useRef("");
   const [prefs, setPrefs] = useState(() => {
     try {
       return { leakUnit: "lmin", pressureDigits: 1, ...JSON.parse(localStorage.getItem("cpap-prefs") || "{}") };
@@ -1835,10 +2670,18 @@ function Dashboard({ parsed, diagnostics, onReset }) {
   const leak95Display = summaryOnly ? leakFromLmin(leak95LMin, prefs) : leakFromLps(session.stats.leak95, prefs);
   const flowRange = session.stats.flowMinMax;
   const canLoadFlow = Boolean(selectedSession?.files.some((file) => file.header.type === "BRP")) && !session.series.flow.length;
+  const fullChartEnd = useMemo(() => sessionFullChartEnd(session), [session]);
+  const sleepSummary = useMemo(() => buildSleepSummary(session, dailyRows, prefs), [session, dailyRows, prefs]);
+  const compliance = useMemo(() => buildComplianceReport(dailyRows), [dailyRows]);
 
   useEffect(() => {
     localStorage.setItem("cpap-prefs", JSON.stringify(prefs));
   }, [prefs]);
+
+  useEffect(() => {
+    setChartRange({ start: 0, end: fullChartEnd });
+    setCrosshairTime(null);
+  }, [selectedSession?.id, fullChartEnd]);
 
   useEffect(() => {
     if (!groups.length) {
@@ -1895,6 +2738,14 @@ function Dashboard({ parsed, diagnostics, onReset }) {
       setFlowLoading(false);
     }
   }
+
+  useEffect(() => {
+    if (!selectedEvent || !canLoadFlow || flowLoading) return;
+    const key = `${selectedSession?.id || ""}:${selectedEvent.onset}:${selectedEvent.label}`;
+    if (autoFlowKeyRef.current === key) return;
+    autoFlowKeyRef.current = key;
+    handleLoadFlow();
+  }, [selectedEvent, canLoadFlow, flowLoading]);
 
   return (
     <main className="screen">
@@ -1970,13 +2821,27 @@ function Dashboard({ parsed, diagnostics, onReset }) {
         dailyRows={dailyRows}
       />
 
+      <SleepSummaryPanel summary={sleepSummary} />
+
+      <div className="content-grid">
+        <ReportActionsPanel session={session} summary={sleepSummary} compliance={compliance} prefs={prefs} />
+        <ComplianceReportPanel compliance={compliance} prefs={prefs} />
+      </div>
+
       <PreferencesPanel prefs={prefs} onChange={setPrefs} />
       <CrcNotePanel />
       <ImportDiagnosticsPanel diagnostics={diagnostics} />
+      <ChartControls range={chartRange} fullEnd={fullChartEnd} onChange={setChartRange} />
 
       <div className="content-grid">
         <Panel title="Therapy timeline" note="pressure, leak, respiratory rate">
-          <TimelineChart session={session} prefs={prefs} />
+          <TimelineChart
+            session={session}
+            prefs={prefs}
+            range={chartRange}
+            crosshairTime={crosshairTime}
+            onCrosshair={setCrosshairTime}
+          />
         </Panel>
 
         <Panel title="Event summary" note="from EDF+ annotations" className="side-panel">
@@ -1994,16 +2859,34 @@ function Dashboard({ parsed, diagnostics, onReset }) {
               <strong>{session.eventCounts.hypopnea}</strong>
             </div>
           </div>
-          <EventsChart session={session} />
+          <EventsChart
+            session={session}
+            range={chartRange}
+            crosshairTime={crosshairTime}
+            onCrosshair={setCrosshairTime}
+          />
         </Panel>
       </div>
 
       <div className="content-grid">
         <Panel title="Breath flow" note="BRP Flow.40ms">
-          <FlowChart session={session} canLoadFlow={canLoadFlow} flowLoading={flowLoading} onLoadFlow={handleLoadFlow} />
+          <FlowChart
+            session={session}
+            canLoadFlow={canLoadFlow}
+            flowLoading={flowLoading}
+            onLoadFlow={handleLoadFlow}
+            range={chartRange}
+            crosshairTime={crosshairTime}
+            onCrosshair={setCrosshairTime}
+          />
         </Panel>
         <Panel title="Oximetry" note="SAD SpO2.1s and Pulse.1s">
-          <OximetryChart session={session} />
+          <OximetryChart
+            session={session}
+            range={chartRange}
+            crosshairTime={crosshairTime}
+            onCrosshair={setCrosshairTime}
+          />
         </Panel>
       </div>
 
@@ -2023,6 +2906,8 @@ function Dashboard({ parsed, diagnostics, onReset }) {
           />
         </Panel>
       </div>
+
+      <EventClustersPanel clusters={session.eventClusters} prefs={prefs} onSelectEvent={setSelectedEvent} />
 
       <div className="content-grid">
         <Panel title="Signal health" note="valid parsed samples">
@@ -2549,6 +3434,10 @@ code {
   min-width: 0;
 }
 
+.screen > .panel {
+  margin-top: 14px;
+}
+
 .panel-head {
   display: flex;
   align-items: baseline;
@@ -2589,6 +3478,137 @@ code {
   grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 8px;
   margin-bottom: 8px;
+}
+
+.summary-lead {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 12px;
+  background: rgba(78, 205, 196, 0.08);
+  border: 1px solid rgba(78, 205, 196, 0.22);
+  border-radius: 8px;
+  color: ${COLORS.text};
+  line-height: 1.45;
+}
+
+.summary-lead svg {
+  flex: 0 0 auto;
+  color: ${COLORS.teal};
+  margin-top: 1px;
+}
+
+.summary-columns {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+  margin-top: 12px;
+}
+
+.summary-columns div {
+  min-width: 0;
+  padding: 12px;
+  background: rgba(23, 32, 55, 0.74);
+  border: 1px solid ${COLORS.border};
+  border-radius: 8px;
+}
+
+.summary-columns h3 {
+  margin: 0 0 8px;
+  font-size: 12px;
+  color: ${COLORS.muted};
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.summary-columns p {
+  color: ${COLORS.muted};
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.summary-columns p + p {
+  margin-top: 6px;
+}
+
+.chart-controls {
+  margin-top: 14px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 10px 12px;
+  background: rgba(18, 26, 46, 0.92);
+  border: 1px solid ${COLORS.border};
+  border-radius: 10px;
+  flex-wrap: wrap;
+}
+
+.range-readout,
+.chart-control-buttons,
+.report-actions,
+.report-checks {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.range-readout {
+  color: ${COLORS.muted};
+  font-family: "SFMono-Regular", Consolas, monospace;
+  font-size: 12px;
+}
+
+.range-readout svg {
+  color: ${COLORS.teal};
+}
+
+.icon-button {
+  width: 34px;
+  height: 34px;
+  display: inline-grid;
+  place-items: center;
+  border: 1px solid ${COLORS.border2};
+  border-radius: 8px;
+  background: transparent;
+  color: ${COLORS.text};
+  cursor: pointer;
+}
+
+.icon-button:hover,
+.secondary-button:hover,
+.reset-button:hover {
+  border-color: ${COLORS.teal};
+}
+
+.report-checks {
+  align-items: stretch;
+}
+
+.report-checks label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 32px;
+  padding: 0 9px;
+  background: rgba(23, 32, 55, 0.74);
+  border: 1px solid ${COLORS.border};
+  border-radius: 8px;
+  color: ${COLORS.muted};
+  font-size: 12px;
+}
+
+.report-checks input {
+  accent-color: ${COLORS.teal};
+}
+
+.report-actions {
+  margin: 10px 0;
+}
+
+.compliance-grid {
+  margin-top: 8px;
 }
 
 .overview-grid {
@@ -2977,7 +3997,8 @@ tbody tr {
 
 @media (max-width: 980px) {
   .stats-grid,
-  .content-grid {
+  .content-grid,
+  .summary-columns {
     grid-template-columns: 1fr;
   }
 
@@ -3007,6 +4028,7 @@ tbody tr {
   .event-counts,
   .overview-grid,
   .diagnostics-grid,
+  .summary-columns,
   .night-picker,
   .mask-row,
   .preferences-grid {
