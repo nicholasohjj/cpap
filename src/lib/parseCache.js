@@ -19,14 +19,31 @@ export function requestWorkerFiles(type, entries, mode, options = {}) {
   workerRequestId = id;
 
   return new Promise((resolve, reject) => {
+    if (options.signal?.aborted) {
+      reject(new Error("Parsing cancelled"));
+      return;
+    }
+    const cleanup = () => {
+      worker.removeEventListener("message", handleMessage);
+      worker.removeEventListener("error", handleError);
+      options.signal?.removeEventListener("abort", handleAbort);
+    };
+    const handleError = (event) => {
+      cleanup();
+      // A crashed worker cannot be reused; drop it so the next request starts fresh.
+      if (edfWorker === worker) {
+        worker.terminate();
+        edfWorker = null;
+      }
+      reject(new Error(event.message || "EDF worker crashed"));
+    };
     const handleMessage = (event) => {
       if (event.data?.id !== id) return;
       if (event.data.progress) {
         options.onProgress?.(event.data);
         return;
       }
-      worker.removeEventListener("message", handleMessage);
-      options.signal?.removeEventListener("abort", handleAbort);
+      cleanup();
       if (event.data.ok) {
         resolve({
           files: event.data.files || [],
@@ -40,6 +57,7 @@ export function requestWorkerFiles(type, entries, mode, options = {}) {
       worker.postMessage({ id, type: "cancel" });
     };
     worker.addEventListener("message", handleMessage);
+    worker.addEventListener("error", handleError);
     options.signal?.addEventListener("abort", handleAbort, { once: true });
     worker.postMessage({ id, type, entries, mode });
   });
@@ -56,6 +74,42 @@ export function toFileEntry(file) {
 export function fileEntriesFromList(fileList) {
   return [...fileList]
     .map(toFileEntry);
+}
+
+function readDirectoryBatch(reader) {
+  return new Promise((resolve, reject) => reader.readEntries(resolve, reject));
+}
+
+function fileFromEntry(entry) {
+  return new Promise((resolve, reject) => entry.file(resolve, reject));
+}
+
+async function collectEntry(entry, out) {
+  if (entry.isFile) {
+    const file = await fileFromEntry(entry);
+    out.push({ file, name: file.name, relativePath: entry.fullPath.replace(/^\//, "") });
+    return;
+  }
+  if (!entry.isDirectory) return;
+  const reader = entry.createReader();
+  // readEntries returns results in batches (100 in Chrome) until it yields an empty array.
+  for (;;) {
+    const batch = await readDirectoryBatch(reader);
+    if (!batch.length) break;
+    for (const child of batch) await collectEntry(child, out);
+  }
+}
+
+// Dropped folders only appear in DataTransfer.files as empty placeholders, so walk the entries.
+export async function fileEntriesFromDataTransfer(dataTransfer) {
+  const roots = [...(dataTransfer.items || [])]
+    .filter((item) => item.kind === "file")
+    .map((item) => item.webkitGetAsEntry?.())
+    .filter(Boolean);
+  if (!roots.length) return fileEntriesFromList(dataTransfer.files || []);
+  const out = [];
+  for (const root of roots) await collectEntry(root, out);
+  return out;
 }
 
 export function cacheKey(entry) {

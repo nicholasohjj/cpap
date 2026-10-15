@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { readdir, readFile } from "node:fs/promises";
 import path from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 import {
   civilDateLabel,
   parseAnnotations,
@@ -13,14 +14,20 @@ import {
   validateCrcEntriesSafely,
 } from "../src/edfParser.js";
 
+const FIXTURES = fileURLToPath(new URL("../public/sample-data/", import.meta.url));
+
+function fixture(relative) {
+  return path.join(FIXTURES, relative);
+}
+
 function bufferToArrayBuffer(buffer) {
   return buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.byteLength);
 }
 
-async function entry(path, relativePath = path) {
-  const buffer = await readFile(path);
+async function entry(filePath, relativePath = filePath) {
+  const buffer = await readFile(fixture(filePath));
   return {
-    name: path.split("/").pop(),
+    name: path.basename(filePath),
     relativePath,
     file: {
       size: buffer.byteLength,
@@ -31,7 +38,7 @@ async function entry(path, relativePath = path) {
 }
 
 async function folderEntries(root, relativePrefix = "") {
-  const names = await readdir(root);
+  const names = await readdir(fixture(root));
   return Promise.all(names
     .filter((name) => /\.(edf|crc)$/i.test(name))
     .sort()
@@ -65,7 +72,7 @@ test("extracts EDF+ event annotations", async () => {
 });
 
 test("converts PLD pressure and leak physical values", async () => {
-  const raw = bufferToArrayBuffer(await readFile("20260712/20260713_005317_PLD.edf"));
+  const raw = bufferToArrayBuffer(await readFile(fixture("20260712/20260713_005317_PLD.edf")));
   const header = parseEdfHeader(raw, "20260713_005317_PLD.edf");
   const signals = parseSignals(raw, header, "detail");
   const pressure95 = percentile(signals["Press.2s"].map((point) => point.value), 95);
@@ -75,7 +82,7 @@ test("converts PLD pressure and leak physical values", async () => {
 });
 
 test("filters out-of-range SAD placeholder samples", async () => {
-  const raw = bufferToArrayBuffer(await readFile("20260712/20260713_005317_SAD.edf"));
+  const raw = bufferToArrayBuffer(await readFile(fixture("20260712/20260713_005317_SAD.edf")));
   const header = parseEdfHeader(raw, "20260713_005317_SAD.edf");
   const signals = parseSignals(raw, header, "detail");
   const validSpo2 = signals["SpO2.1s"].filter((point) => Number.isFinite(point.value));
@@ -83,7 +90,7 @@ test("filters out-of-range SAD placeholder samples", async () => {
 });
 
 test("parses CSL without scoring false events", async () => {
-  const raw = bufferToArrayBuffer(await readFile("20260712/20260713_005314_CSL.edf"));
+  const raw = bufferToArrayBuffer(await readFile(fixture("20260712/20260713_005314_CSL.edf")));
   const header = parseEdfHeader(raw, "20260713_005314_CSL.edf");
   assert.equal(parseAnnotations(raw, header).length, 0);
 });

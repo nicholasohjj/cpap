@@ -50,17 +50,20 @@ import {
   clamp,
   compact,
   durationLabel,
+  envelopeSeries,
   leakFromLmin,
   leakFromLps,
   leakUnitLabel,
+  maskWindowLabel,
   maskWindowSummary,
   mean,
-  minuteOfDayLabel,
   round,
+  sliceByTime,
   timeLabel,
 } from "./lib/format.js";
 import {
   clearParseCache,
+  fileEntriesFromDataTransfer,
   fileEntriesFromList,
   getCachedSummaries,
   hydrateSignalFiles,
@@ -142,8 +145,11 @@ const SAMPLE_EDF_PATHS = [
 function UploadPanel({ onLoad, onLoadSample, onCancel, onClearCache, error, loading, progress, cacheStats }) {
   const [dragging, setDragging] = useState(false);
 
-  async function handleFiles(fileList) {
-    await onLoad(fileEntriesFromList(fileList));
+  async function handleInputChange(event) {
+    const entries = fileEntriesFromList(event.target.files || []);
+    // Clear the input so choosing the same folder again still fires onChange.
+    event.target.value = "";
+    if (entries.length) await onLoad(entries);
   }
 
   return (
@@ -152,23 +158,28 @@ function UploadPanel({ onLoad, onLoadSample, onCancel, onClearCache, error, load
         className={`dropzone ${dragging ? "is-dragging" : ""}`}
         onDragOver={(event) => {
           event.preventDefault();
-          setDragging(true);
+          if (!loading) setDragging(true);
         }}
-        onDragLeave={() => setDragging(false)}
+        onDragLeave={(event) => {
+          // Moving between child elements fires dragleave on the parent; ignore those.
+          if (!event.currentTarget.contains(event.relatedTarget)) setDragging(false);
+        }}
         onDrop={(event) => {
           event.preventDefault();
           setDragging(false);
-          handleFiles(event.dataTransfer.files);
+          if (loading) return;
+          // Entries must be read synchronously inside the drop handler.
+          fileEntriesFromDataTransfer(event.dataTransfer).then(onLoad);
         }}
       >
         <Moon className="brand-icon" size={30} />
         <h1>CPAP EDF dashboard</h1>
         <p>
-          Load a ResMed EDF folder or individual EDF files. The parser reads headers, EDF+
+          Drop or choose a ResMed SD card / DATALOG folder, or individual EDF files. The parser reads headers, EDF+
           annotations, 40 ms breath data, 2 s therapy metrics, oximetry, and daily STR summary files.
         </p>
         <div className="upload-actions">
-          <label className="primary-button">
+          <label className={`primary-button ${loading ? "is-disabled" : ""}`}>
             <FolderOpen size={16} />
             Choose folder
             <input
@@ -176,17 +187,19 @@ function UploadPanel({ onLoad, onLoadSample, onCancel, onClearCache, error, load
               webkitdirectory=""
               directory=""
               multiple
-              onChange={(event) => handleFiles(event.target.files)}
+              disabled={loading}
+              onChange={handleInputChange}
             />
           </label>
-          <label className="secondary-button">
+          <label className={`secondary-button ${loading ? "is-disabled" : ""}`}>
             <Upload size={16} />
             Choose EDF files
             <input
               type="file"
               accept=".edf,.crc"
               multiple
-              onChange={(event) => handleFiles(event.target.files)}
+              disabled={loading}
+              onChange={handleInputChange}
             />
           </label>
           <button type="button" className="secondary-button" onClick={onLoadSample} disabled={loading}>
@@ -258,7 +271,7 @@ function ChartTooltip({ active, payload, label }) {
   if (!active || !payload?.length) return null;
   return (
     <div className="tooltip">
-      <div className="tooltip-label">{label}</div>
+      <div className="tooltip-label">{Number.isFinite(label) ? timeLabel(label) : label}</div>
       {payload.map((entry) => (
         <div key={entry.dataKey} style={{ color: entry.color }}>
           {entry.name || entry.dataKey}: {compact(entry.value, 2)}
@@ -295,6 +308,28 @@ function zoomRange(range, fullEnd, factor) {
   const span = clamp(currentSpan * factor, 60, Math.max(60, fullEnd));
   const start = clamp(center - span / 2, 0, Math.max(0, fullEnd - span));
   return { start, end: Math.min(fullEnd, start + span) };
+}
+
+// Recharts locates axes by element type, so this must be spread onto <XAxis> rather than wrap it.
+function timeAxisProps(range, minTickGap = 36) {
+  return {
+    dataKey: "time",
+    type: "number",
+    scale: "linear",
+    domain: range ? [range.start, range.end] : ["dataMin", "dataMax"],
+    allowDataOverflow: true,
+    minTickGap,
+    tickFormatter: timeLabel,
+    tick: { fill: COLORS.faint, fontSize: 11 },
+    axisLine: { stroke: COLORS.border },
+    tickLine: false,
+  };
+}
+
+function eventColor(label) {
+  if (/central/i.test(label)) return COLORS.amber;
+  if (/obstructive/i.test(label)) return COLORS.coral;
+  return COLORS.blue;
 }
 
 function ChartControls({ range, fullEnd, onChange }) {
@@ -359,13 +394,7 @@ function TimelineChart({ session, prefs, range, crosshairTime, onCrosshair }) {
         onMouseLeave={() => onCrosshair?.(null)}
       >
         <CartesianGrid stroke={COLORS.grid} vertical={false} />
-        <XAxis
-          dataKey="label"
-          minTickGap={36}
-          tick={{ fill: COLORS.faint, fontSize: 11 }}
-          axisLine={{ stroke: COLORS.border }}
-          tickLine={false}
-        />
+        <XAxis {...timeAxisProps(range)} />
         <YAxis
           yAxisId="left"
           tick={{ fill: COLORS.faint, fontSize: 11 }}
@@ -383,13 +412,13 @@ function TimelineChart({ session, prefs, range, crosshairTime, onCrosshair }) {
         />
         <Tooltip cursor={{ stroke: COLORS.text, strokeOpacity: 0.18 }} content={<ChartTooltip />} />
         {Number.isFinite(crosshairTime) && timeInRange(crosshairTime, range) ? (
-          <ReferenceLine x={timeLabel(crosshairTime)} yAxisId="left" stroke={COLORS.text} strokeOpacity={0.28} />
+          <ReferenceLine x={crosshairTime} yAxisId="left" stroke={COLORS.text} strokeOpacity={0.28} />
         ) : null}
         {clusters.map((cluster) => (
           <ReferenceArea
             key={`cluster-${cluster.id}`}
-            x1={timeLabel(cluster.start)}
-            x2={timeLabel(cluster.end)}
+            x1={Math.max(cluster.start, range.start)}
+            x2={Math.min(cluster.end, range.end)}
             yAxisId="left"
             fill={COLORS.amber}
             fillOpacity={0.08}
@@ -398,8 +427,8 @@ function TimelineChart({ session, prefs, range, crosshairTime, onCrosshair }) {
         {gaps.map((gap, index) => (
           <ReferenceArea
             key={`gap-${index}`}
-            x1={timeLabel(Math.max(gap.start, range.start))}
-            x2={timeLabel(Math.min(gap.end, range.end))}
+            x1={Math.max(gap.start, range.start)}
+            x2={Math.min(gap.end, range.end)}
             fill={COLORS.coral}
             fillOpacity={0.08}
             yAxisId="left"
@@ -408,7 +437,7 @@ function TimelineChart({ session, prefs, range, crosshairTime, onCrosshair }) {
         {segments.map((segment, index) => (
           <ReferenceLine
             key={`segment-${segment.type}-${index}`}
-            x={segment.startLabel}
+            x={segment.start}
             yAxisId="left"
             stroke={COLORS.faint}
             strokeDasharray="3 4"
@@ -418,9 +447,9 @@ function TimelineChart({ session, prefs, range, crosshairTime, onCrosshair }) {
         {eventMarkers.map((event, index) => (
           <ReferenceLine
             key={`event-${event.onset}-${index}`}
-            x={event.time}
+            x={event.onset}
             yAxisId="left"
-            stroke={/central/i.test(event.label) ? COLORS.amber : /obstructive/i.test(event.label) ? COLORS.coral : COLORS.blue}
+            stroke={eventColor(event.label)}
             strokeOpacity={0.28}
           />
         ))}
@@ -460,7 +489,14 @@ function TimelineChart({ session, prefs, range, crosshairTime, onCrosshair }) {
 }
 
 function FlowChart({ session, canLoadFlow, flowLoading, onLoadFlow, range, crosshairTime, onCrosshair }) {
-  const data = filterChartData(session.series.flow, range).map((point) => ({ ...point, flow: point.value }));
+  const data = useMemo(() => {
+    const raw = session.rawSeries?.flow || [];
+    // Re-sample from the raw 25 Hz signal so zooming in reveals individual breaths.
+    const points = raw.length && range
+      ? envelopeSeries(sliceByTime(raw, range.start, range.end), 1500)
+      : filterChartData(session.series.flow, range);
+    return points.map((point) => ({ ...point, flow: point.value }));
+  }, [session, range]);
   if (!data.length) {
     return (
       <EmptyState label={canLoadFlow ? "BRP waveform data is available but not loaded yet." : "No BRP flow signal was loaded."}>
@@ -479,12 +515,21 @@ function FlowChart({ session, canLoadFlow, flowLoading, onLoadFlow, range, cross
 function CanvasWaveform({ data, range, crosshairTime, onCrosshair }) {
   const canvasRef = useRef(null);
   const layoutRef = useRef(null);
+  const [containerWidth, setContainerWidth] = useState(0);
+
+  useEffect(() => {
+    const parent = canvasRef.current?.parentElement;
+    if (!parent || typeof ResizeObserver === "undefined") return undefined;
+    const observer = new ResizeObserver(([entry]) => setContainerWidth(Math.floor(entry.contentRect.width)));
+    observer.observe(parent);
+    return () => observer.disconnect();
+  }, []);
 
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas || !data.length) return;
     const parent = canvas.parentElement;
-    const width = parent?.clientWidth || 800;
+    const width = containerWidth || parent?.clientWidth || 800;
     const height = 240;
     const ratio = window.devicePixelRatio || 1;
     canvas.width = width * ratio;
@@ -498,9 +543,17 @@ function CanvasWaveform({ data, range, crosshairTime, onCrosshair }) {
     ctx.fillStyle = "#0d1425";
     ctx.fillRect(0, 0, width, height);
 
-    const values = data.map((point) => point.flow).filter(Number.isFinite);
-    const min = Math.min(...values);
-    const max = Math.max(...values);
+    let min = Infinity;
+    let max = -Infinity;
+    data.forEach((point) => {
+      if (!Number.isFinite(point.flow)) return;
+      if (point.flow < min) min = point.flow;
+      if (point.flow > max) max = point.flow;
+    });
+    if (!Number.isFinite(min)) {
+      min = -1;
+      max = 1;
+    }
     const minLabel = `${compact(min, 2)} L/s`;
     const maxLabel = `${compact(max, 2)} L/s`;
     ctx.font = "11px SFMono-Regular, Consolas, monospace";
@@ -531,11 +584,18 @@ function CanvasWaveform({ data, range, crosshairTime, onCrosshair }) {
     ctx.strokeStyle = COLORS.teal;
     ctx.lineWidth = 1.4;
     ctx.beginPath();
-    data.forEach((point, index) => {
+    let penDown = false;
+    data.forEach((point) => {
+      // Break the line at invalid samples instead of drawing to NaN.
+      if (!Number.isFinite(point.flow)) {
+        penDown = false;
+        return;
+      }
       const x = xForTime(point.time);
       const y = yFor(point.flow);
-      if (index === 0) ctx.moveTo(x, y);
-      else ctx.lineTo(x, y);
+      if (penDown) ctx.lineTo(x, y);
+      else ctx.moveTo(x, y);
+      penDown = true;
     });
     ctx.stroke();
 
@@ -558,10 +618,10 @@ function CanvasWaveform({ data, range, crosshairTime, onCrosshair }) {
     ctx.fillText(maxLabel, 8, topPad);
     ctx.fillText(minLabel, 8, topPad + plotHeight);
     ctx.textBaseline = "alphabetic";
-    ctx.fillText(data[0]?.label || "00:00:00", leftPad, height - 8);
+    ctx.fillText(timeLabel(domainStart), leftPad, height - 8);
     ctx.textAlign = "right";
-    ctx.fillText(data[data.length - 1]?.label || "", width - rightPad, height - 8);
-  }, [data, range, crosshairTime]);
+    ctx.fillText(timeLabel(domainEnd), width - rightPad, height - 8);
+  }, [data, range, crosshairTime, containerWidth]);
 
   function handleMouseMove(event) {
     const layout = layoutRef.current;
@@ -611,13 +671,7 @@ function OximetryChart({ session, range, crosshairTime, onCrosshair }) {
         onMouseLeave={() => onCrosshair?.(null)}
       >
         <CartesianGrid stroke={COLORS.grid} vertical={false} />
-        <XAxis
-          dataKey="label"
-          minTickGap={38}
-          tick={{ fill: COLORS.faint, fontSize: 11 }}
-          axisLine={{ stroke: COLORS.border }}
-          tickLine={false}
-        />
+        <XAxis {...timeAxisProps(range, 38)} />
         <YAxis
           yAxisId="left"
           domain={[80, 100]}
@@ -636,7 +690,7 @@ function OximetryChart({ session, range, crosshairTime, onCrosshair }) {
         />
         <Tooltip cursor={{ stroke: COLORS.text, strokeOpacity: 0.18 }} content={<ChartTooltip />} />
         {Number.isFinite(crosshairTime) && timeInRange(crosshairTime, range) ? (
-          <ReferenceLine x={timeLabel(crosshairTime)} yAxisId="left" stroke={COLORS.text} strokeOpacity={0.28} />
+          <ReferenceLine x={crosshairTime} yAxisId="left" stroke={COLORS.text} strokeOpacity={0.28} />
         ) : null}
         <Line yAxisId="left" type="monotone" dataKey="spo2" name="SpO2 %" stroke={COLORS.teal} strokeWidth={1.8} dot={false} />
         <Line yAxisId="right" type="monotone" dataKey="pulse" name="Pulse bpm" stroke={COLORS.coral} strokeWidth={1.5} dot={false} />
@@ -654,7 +708,7 @@ function EventDetailPanel({ event, session, onClear, prefs, canLoadFlow, flowLoa
   const leak = session.series.leak
     .filter((point) => point.time >= start && point.time <= end)
     .map((point) => ({ ...point, value: leakFromLps(point.value, prefs) }));
-  const rawFlow = (session.rawSeries?.flow || []).filter((point) => point.t >= start && point.t <= end);
+  const rawFlow = sliceByTime(session.rawSeries?.flow || [], start, end);
   const flow = rawFlow.map((point) => ({ time: point.t, label: timeLabel(point.t), value: round(point.value, 3), flow: point.value }));
   const chartData = mergeSeries(pressure, [
     { key: "pressure", series: pressure },
@@ -672,12 +726,12 @@ function EventDetailPanel({ event, session, onClear, prefs, canLoadFlow, flowLoa
         <button type="button" className="secondary-button inline-action" onClick={onClear}>Clear</button>
       </div>
       <ResponsiveContainer width="100%" height={210}>
-        <ComposedChart data={chartData} margin={{ top: 8, right: 18, left: -8, bottom: 0 }}>
+        <ComposedChart data={chartData} margin={{ top: 8, right: 28, left: -8, bottom: 0 }}>
           <CartesianGrid stroke={COLORS.grid} vertical={false} />
-          <XAxis dataKey="label" minTickGap={34} tick={{ fill: COLORS.faint, fontSize: 11 }} axisLine={{ stroke: COLORS.border }} tickLine={false} />
+          <XAxis {...timeAxisProps(focusRange, 34)} />
           <YAxis tick={{ fill: COLORS.faint, fontSize: 11 }} axisLine={false} tickLine={false} width={38} />
           <Tooltip content={<ChartTooltip />} />
-          <ReferenceLine x={event.time} stroke={COLORS.amber} strokeDasharray="4 3" />
+          <ReferenceLine x={event.onset} stroke={COLORS.amber} strokeDasharray="4 3" />
           <Line type="monotone" dataKey="pressure" name="Pressure cmH2O" stroke={COLORS.amber} strokeWidth={2} dot={false} connectNulls />
           <Line type="monotone" dataKey="leakDisplay" name={`Leak ${leakUnitLabel(prefs)}`} stroke={COLORS.teal} strokeWidth={1.6} dot={false} connectNulls />
           <Line type="monotone" dataKey="flow" name="Flow L/s" stroke={COLORS.blue} strokeWidth={1.2} dot={false} connectNulls />
@@ -698,11 +752,11 @@ function EventDetailPanel({ event, session, onClear, prefs, canLoadFlow, flowLoa
   );
 }
 
-function EventsChart({ session, range, crosshairTime, onCrosshair }) {
+function EventsChart({ session, prefs, range, crosshairTime, onCrosshair }) {
   const data = session.events.filter((event) => timeInRange(event.onset, range)).map((event) => ({
     ...event,
     y: 1,
-    color: /central/i.test(event.label) ? COLORS.amber : /obstructive/i.test(event.label) ? COLORS.coral : COLORS.blue,
+    color: eventColor(event.label),
   }));
   if (!session.events.length) return <EmptyState label="No scored respiratory events were found." />;
   if (!data.length) return <EmptyState label="No scored events in the selected range." />;
@@ -744,7 +798,7 @@ function EventsChart({ session, range, crosshairTime, onCrosshair }) {
                 <div>{event.label}</div>
                 <div>Duration: {compact(event.duration, 0)}s</div>
                 <div>Pressure: {compact(event.pressure, 1)} cmH2O</div>
-                <div>Leak: {compact((event.leak || 0) * 60, 1)} L/min</div>
+                <div>Leak: {compact(leakFromLps(event.leak, prefs), 1)} {leakUnitLabel(prefs)}</div>
               </div>
             );
           }}
@@ -779,7 +833,7 @@ function EventTable({ events, selectedEvent, onSelectEvent, prefs }) {
     duration_seconds: round(event.duration, 0),
     onset_seconds: round(event.onset, 0),
     pressure_cmH2O: round(event.pressure, 2),
-    [`leak_${leakUnitLabel(prefs).replace("/", "_")}`]: round(leakFromLps(event.leak || 0, prefs), 2),
+    [`leak_${leakUnitLabel(prefs).replace("/", "_")}`]: round(leakFromLps(event.leak, prefs), 2),
   }));
   return (
     <>
@@ -795,7 +849,7 @@ function EventTable({ events, selectedEvent, onSelectEvent, prefs }) {
           { key: "label", header: "Event" },
           { key: "duration", header: "Duration", render: (event) => `${compact(event.duration, 0)}s` },
           { key: "pressure", header: "Pressure", render: (event) => `${compact(event.pressure, 1)} cmH2O` },
-          { key: "leak", header: "Leak", render: (event) => `${compact(leakFromLps(event.leak || 0, prefs), 1)} ${leakUnitLabel(prefs)}` },
+          { key: "leak", header: "Leak", render: (event) => `${compact(leakFromLps(event.leak, prefs), 1)} ${leakUnitLabel(prefs)}` },
         ]}
       />
     </>
@@ -866,6 +920,16 @@ function MaskTimeline({ rows }) {
   if (!visibleRows.length) return null;
   return (
     <div className="mask-timeline">
+      <div className="mask-row mask-scale" aria-hidden="true">
+        <span />
+        <div>
+          <span>12:00</span>
+          <span>18:00</span>
+          <span>00:00</span>
+          <span>06:00</span>
+          <span>12:00</span>
+        </div>
+      </div>
       {visibleRows.map((row) => (
         <div className="mask-row" key={row.date}>
           <span>{row.date}</span>
@@ -873,7 +937,7 @@ function MaskTimeline({ rows }) {
             {row.maskWindows.map((window, index) => (
               <i
                 key={`${row.date}-${index}`}
-                title={`${row.date} ${minuteOfDayLabel(window.on)}-${minuteOfDayLabel(window.rawOff)}`}
+                title={`${row.date} night ${maskWindowLabel(window)}`}
                 style={{
                   left: `${Math.min(100, (window.on / 1440) * 100)}%`,
                   width: `${Math.max(0.5, Math.min(100, (window.minutes / 1440) * 100))}%`,
@@ -1283,8 +1347,8 @@ function ImportDiagnosticsPanel({ diagnostics }) {
       </div>
       {failures.length ? (
         <div className="failure-list">
-          {failures.slice(0, 6).map((failure) => (
-            <div key={failure.relativePath}>
+          {failures.slice(0, 6).map((failure, index) => (
+            <div key={`${failure.relativePath}-${index}`}>
               <strong>{failure.relativePath}</strong>
               <span>{failure.error}</span>
             </div>
@@ -1384,6 +1448,22 @@ function sessionFullChartEnd(session) {
   return Math.max(60, session.therapySeconds || 0, eventEnd, ...seriesEnds);
 }
 
+// Combine two hydration passes (detail + flow) that may finish in either order.
+function mergeHydratedFiles(current, next) {
+  if (!current.length) return next;
+  const byPath = new Map(current.map((file) => [file.relativePath, file]));
+  return next.map((file) => {
+    const previous = byPath.get(file.relativePath);
+    if (!previous) return file;
+    return {
+      ...file,
+      signals: { ...previous.signals, ...file.signals },
+      signalsLoaded: previous.signalsLoaded || file.signalsLoaded,
+      flowLoaded: previous.flowLoaded || file.flowLoaded,
+    };
+  });
+}
+
 function Dashboard({ parsed, diagnostics, onReset }) {
   const dailyRows = useMemo(() => buildDailyRows(parsed), [parsed]);
   const groups = useMemo(() => buildTherapyGroups(parsed, dailyRows), [parsed, dailyRows]);
@@ -1396,6 +1476,7 @@ function Dashboard({ parsed, diagnostics, onReset }) {
   const [chartRange, setChartRange] = useState({ start: 0, end: 60 });
   const [crosshairTime, setCrosshairTime] = useState(null);
   const autoFlowKeyRef = useRef("");
+  const hydrationKeyRef = useRef("");
   const [prefs, setPrefs] = useState(() => {
     try {
       return { leakUnit: "lmin", pressureDigits: 1, ...JSON.parse(localStorage.getItem("cpap-prefs") || "{}") };
@@ -1411,6 +1492,10 @@ function Dashboard({ parsed, diagnostics, onReset }) {
     () => selectedNight?.sessions.find((session) => session.id === selectedSessionId) || selectedNight?.sessions[selectedNight.sessions.length - 1] || null,
     [selectedNight, selectedSessionId]
   );
+  // Background CRC results replace `parsed` with new objects; key hydration on identity, not reference.
+  const hydrationKey = selectedSession
+    ? `${selectedSession.id}|${selectedSession.files.map((file) => file.relativePath).join(",")}`
+    : "";
   const activeFiles = detailFiles.length ? detailFiles : selectedSession?.files || selectedNight?.files || parsed;
   const session = useMemo(() => buildSession(activeFiles), [activeFiles]);
   const rows = useMemo(() => buildOverviewRows(parsed), [parsed]);
@@ -1464,37 +1549,38 @@ function Dashboard({ parsed, diagnostics, onReset }) {
   }, [selectedNight, selectedSessionId]);
 
   useEffect(() => {
-    let cancelled = false;
-    async function hydrateSelectedGroup() {
-      if (!selectedSession) {
-        setDetailFiles([]);
-        return;
-      }
-      setDetailLoading(true);
-      try {
-        const hydrated = await hydrateSignalFiles(selectedSession.files, "detail");
-        if (!cancelled) setDetailFiles(hydrated);
-      } finally {
-        if (!cancelled) setDetailLoading(false);
-      }
-    }
+    hydrationKeyRef.current = hydrationKey;
     setDetailFiles([]);
     setSelectedEvent(null);
-    hydrateSelectedGroup();
+    setFlowLoading(false);
+    if (!selectedSession) return undefined;
+    let cancelled = false;
+    setDetailLoading(true);
+    hydrateSignalFiles(selectedSession.files, "detail")
+      .then((hydrated) => {
+        if (!cancelled) setDetailFiles((current) => mergeHydratedFiles(current, hydrated));
+      })
+      .catch((err) => console.error("Failed to load session detail signals", err))
+      .finally(() => {
+        if (!cancelled) setDetailLoading(false);
+      });
     return () => {
       cancelled = true;
     };
-  }, [selectedSession]);
+    // selectedSession is captured through hydrationKey; depending on it directly re-hydrates on CRC updates.
+  }, [hydrationKey]);
 
   async function handleLoadFlow() {
     if (!selectedSession) return;
+    const key = hydrationKey;
     setFlowLoading(true);
     try {
-      const baseFiles = detailFiles.length ? detailFiles : selectedSession.files;
-      const hydrated = await hydrateSignalFiles(baseFiles, "flow");
-      setDetailFiles(hydrated);
+      const hydrated = await hydrateSignalFiles(selectedSession.files, "flow");
+      if (hydrationKeyRef.current === key) setDetailFiles((current) => mergeHydratedFiles(current, hydrated));
+    } catch (err) {
+      console.error("Failed to load BRP flow", err);
     } finally {
-      setFlowLoading(false);
+      if (hydrationKeyRef.current === key) setFlowLoading(false);
     }
   }
 
@@ -1620,6 +1706,7 @@ function Dashboard({ parsed, diagnostics, onReset }) {
           </div>
           <EventsChart
             session={session}
+            prefs={prefs}
             range={chartRange}
             crosshairTime={crosshairTime}
             onCrosshair={setCrosshairTime}
@@ -1653,7 +1740,7 @@ function Dashboard({ parsed, diagnostics, onReset }) {
         <Panel title="Events" note="pressure/leak sampled near event onset">
           <EventTable events={session.events} selectedEvent={selectedEvent} onSelectEvent={setSelectedEvent} prefs={prefs} />
         </Panel>
-        <Panel title="Event focus" note="±60 seconds where available">
+        <Panel title="Event focus" note={`±${EVENT_FOCUS_PAD_SECONDS} seconds where available`}>
           <EventDetailPanel
             event={selectedEvent}
             session={session}
@@ -1671,11 +1758,13 @@ function Dashboard({ parsed, diagnostics, onReset }) {
       <div className="content-grid">
         <Panel title="Signal health" note="valid parsed samples">
           <SignalHealth session={session} />
-          <div className="note-box">
-            <ListChecks size={16} />
-            The included sample SAD file contains only invalid oximetry placeholders, so SpO2 and
-            pulse intentionally show as unavailable.
-          </div>
+          {session.grouped.SAD.length && !session.series.spo2.length ? (
+            <div className="note-box">
+              <ListChecks size={16} />
+              The SAD file contains only invalid oximetry placeholders (no oximeter was attached), so
+              SpO2 and pulse show as unavailable.
+            </div>
+          ) : null}
         </Panel>
       </div>
 
@@ -2041,7 +2130,8 @@ h1, h2, p {
   color: ${COLORS.text};
 }
 
-.secondary-button:disabled {
+.secondary-button:disabled,
+.is-disabled {
   cursor: wait;
   opacity: 0.65;
 }
@@ -2577,6 +2667,16 @@ code {
   color: ${COLORS.muted};
   font-family: "SFMono-Regular", Consolas, monospace;
   font-size: 11px;
+}
+
+.mask-scale > div {
+  display: flex;
+  justify-content: space-between;
+}
+
+.mask-scale > div span {
+  color: ${COLORS.faint};
+  font-size: 10px;
 }
 
 .mask-track {

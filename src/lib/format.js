@@ -96,28 +96,52 @@ export function inferStep(series) {
   return Math.max(0.001, series[1].t - series[0].t);
 }
 
-export function nearestAt(series, seconds) {
-  if (!series?.length) return null;
-  const index = Math.max(0, Math.min(series.length - 1, Math.round(seconds / inferStep(series))));
-  return series[index]?.value ?? null;
+// First index whose `key` is >= target; series must be sorted by that key.
+export function lowerBound(series, target, key = "t") {
+  let lo = 0;
+  let hi = series.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (series[mid][key] < target) lo = mid + 1;
+    else hi = mid;
+  }
+  return lo;
 }
 
-export function downsampleSeries(series, maxPoints = 1200) {
+// Series may be stitched from several files with gaps, so search by time rather than index math.
+export function nearestAt(series, seconds, maxDistance = Math.max(2, inferStep(series) * 2)) {
+  if (!series?.length || !Number.isFinite(seconds)) return null;
+  const index = lowerBound(series, seconds);
+  const candidates = [series[index - 1], series[index]].filter(Boolean);
+  const nearest = candidates.reduce((best, point) => (
+    !best || Math.abs(point.t - seconds) < Math.abs(best.t - seconds) ? point : best
+  ), null);
+  if (!nearest || Math.abs(nearest.t - seconds) > maxDistance) return null;
+  return Number.isFinite(nearest.value) ? nearest.value : null;
+}
+
+export function sliceByTime(series, start, end, key = "t") {
   if (!series?.length) return [];
-  const clean = series.filter((point) => Number.isFinite(point.value));
-  if (clean.length <= maxPoints) {
-    return clean.map((point) => ({ time: point.t, label: timeLabel(point.t), value: round(point.value, 3) }));
-  }
-  const bucketSize = Math.ceil(clean.length / maxPoints);
+  return series.slice(lowerBound(series, start, key), lowerBound(series, end + 1e-9, key));
+}
+
+// Min/max per bucket keeps breath amplitude visible where averaging would flatten the waveform.
+export function envelopeSeries(series, maxBuckets = 1200) {
+  const clean = (series || []).filter((point) => Number.isFinite(point.value));
+  const toPoint = (point) => ({ time: point.t, label: timeLabel(point.t), value: round(point.value, 3) });
+  if (clean.length <= maxBuckets * 2) return clean.map(toPoint);
+  const bucketSize = Math.ceil(clean.length / maxBuckets);
   const output = [];
   for (let i = 0; i < clean.length; i += bucketSize) {
-    const bucket = clean.slice(i, i + bucketSize);
-    const avg = mean(bucket.map((point) => point.value));
-    output.push({
-      time: bucket[Math.floor(bucket.length / 2)].t,
-      label: timeLabel(bucket[Math.floor(bucket.length / 2)].t),
-      value: round(avg, 3),
-    });
+    let lo = clean[i];
+    let hi = clean[i];
+    for (let j = i + 1; j < Math.min(clean.length, i + bucketSize); j += 1) {
+      if (clean[j].value < lo.value) lo = clean[j];
+      if (clean[j].value > hi.value) hi = clean[j];
+    }
+    if (lo === hi) output.push(toPoint(lo));
+    else if (lo.t < hi.t) output.push(toPoint(lo), toPoint(hi));
+    else output.push(toPoint(hi), toPoint(lo));
   }
   return output;
 }
@@ -145,7 +169,27 @@ export function minuteOfDayLabel(minutes) {
   return `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}`;
 }
 
+const NOON_MINUTES = 12 * 60;
+const NOON_MS = NOON_MINUTES * 60 * 1000;
+
+// ResMed STR MaskOn/MaskOff values are minutes since noon of the STR record date.
+export function maskWindowLabel(window) {
+  return `${minuteOfDayLabel(window.on + NOON_MINUTES)}-${minuteOfDayLabel(window.off + NOON_MINUTES)}`;
+}
+
 export function maskWindowSummary(windows) {
   if (!windows?.length) return "--";
-  return windows.map((window) => `${minuteOfDayLabel(window.on)}-${minuteOfDayLabel(window.rawOff)}`).join(", ");
+  return windows.map(maskWindowLabel).join(", ");
+}
+
+// ResMed (and OSCAR) assign anything before noon to the previous day's night.
+export function therapyDayFor(ms) {
+  if (!Number.isFinite(ms) || !ms) return "";
+  return isoDate(new Date(ms - NOON_MS));
+}
+
+export function minutesSinceTherapyNoon(ms) {
+  const day = therapyDayFor(ms);
+  if (!day) return null;
+  return (ms - (Date.parse(`${day}T00:00:00Z`) + NOON_MS)) / 60000;
 }

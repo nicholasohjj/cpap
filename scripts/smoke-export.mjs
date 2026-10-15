@@ -2,7 +2,7 @@ import { readdir, readFile, stat } from "node:fs/promises";
 import path from "node:path";
 import { parseEdfEntriesSafely, validateCrcEntriesSafely } from "../src/edfParser.js";
 
-const root = process.argv[2] || "20260712";
+const root = process.argv[2] || "public/sample-data/20260712";
 
 async function walk(dir) {
   const out = [];

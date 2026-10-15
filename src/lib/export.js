@@ -10,13 +10,14 @@ export function downloadText(fileName, text, type) {
   document.body.appendChild(link);
   link.click();
   link.remove();
-  URL.revokeObjectURL(url);
+  // Revoking synchronously can cancel the download in Safari and Firefox.
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
 export function csvCell(value) {
   if (value === null || value === undefined) return "";
   const text = Array.isArray(value) ? value.join("; ") : String(value);
-  return /[",\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
+  return /[",\r\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
 }
 
 export function toCsv(rows) {

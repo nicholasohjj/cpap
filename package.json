@@ -7,7 +7,7 @@
     "dev": "vite --host 127.0.0.1",
     "build": "vite build",
     "preview": "vite preview --host 127.0.0.1",
-    "test": "node --test tests/parser.test.mjs",
+    "test": "node --test tests/parser.test.mjs tests/lib.test.mjs",
     "test:ui": "playwright test",
     "smoke:export": "node scripts/smoke-export.mjs",
     "crc:sidecar": "node scripts/analyze-sidecar-crc.mjs"

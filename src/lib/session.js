@@ -10,17 +10,19 @@ import {
   civilToSortMs,
   clockLabel,
   compact,
-  downsampleSeries,
   durationLabel,
+  envelopeSeries,
   isoDate,
   leakFromLmin,
   leakUnitLabel,
   mean,
   minMax,
-  minuteOfDayLabel,
+  maskWindowLabel,
+  minutesSinceTherapyNoon,
   nearestAt,
   percentile,
   sampleEvery,
+  therapyDayFor,
   timeLabel,
 } from "./format.js";
 
@@ -269,7 +271,7 @@ export function buildSession(files) {
       pulseMedian: percentile(pulseValues, 50),
     },
     series: {
-      flow: downsampleSeries(flow, 1200),
+      flow: envelopeSeries(flow, 1200),
       pressure: sampleEvery(pressure.length ? pressure : pressure40ms, pressure.length ? 1 : 50),
       leak: sampleEvery(leak),
       respiration: sampleEvery(respiration),
@@ -440,10 +442,9 @@ export function buildDailyRows(files) {
         const maskWindows = maskOns
           .map((on, index) => {
             const off = maskOffs[index];
-            if (!Number.isFinite(on) || !Number.isFinite(off) || (on === 0 && off === 0)) return null;
-            const normalizedOff = off < on ? off + 1440 : off;
-            if (normalizedOff <= on) return null;
-            return { on, off: normalizedOff, rawOff: off, minutes: normalizedOff - on };
+            // Minutes since noon; OSCAR treats on === off (including 0/0) as an empty slot.
+            if (!Number.isFinite(on) || !Number.isFinite(off) || on < 0 || off > 1440 || off <= on) return null;
+            return { on, off, minutes: off - on };
           })
           .filter(Boolean);
         rows.push({
@@ -497,7 +498,11 @@ export function valueOrFallback(primary, fallback) {
 }
 
 export function buildSleepSummary(session, dailyRows, prefs) {
-  const dailyForDate = dailyRows.find((row) => row.date === session.date) || dailyRows[dailyRows.length - 1] || null;
+  const therapyDay = therapyDayFor(session.primary ? fileStartMs(session.primary) : null);
+  const dailyForDate = dailyRows.find((row) => row.date === therapyDay)
+    || dailyRows.find((row) => row.date === session.date)
+    || dailyRows[dailyRows.length - 1]
+    || null;
   const therapySeconds = session.therapySeconds > 0
     ? session.therapySeconds
     : (Number.isFinite(dailyForDate?.usageMinutes) ? dailyForDate.usageMinutes * 60 : null);
@@ -588,12 +593,12 @@ export function datalogGroupKey(file) {
 
 export function findMaskWindowForCluster(cluster, dailyRows) {
   if (!cluster.startMs) return null;
-  const start = new Date(cluster.startMs);
-  const date = isoDate(start);
-  const minute = start.getUTCHours() * 60 + start.getUTCMinutes();
+  const date = therapyDayFor(cluster.startMs);
+  const minute = minutesSinceTherapyNoon(cluster.startMs);
   const row = dailyRows.find((item) => item.date === date);
-  const window = row?.maskWindows?.find((item) => minute >= item.on && minute <= item.off);
-  return window ? `${minuteOfDayLabel(window.on)}-${minuteOfDayLabel(window.rawOff)}` : null;
+  // Session files start a few seconds after the mask goes on, so allow a little slack.
+  const window = row?.maskWindows?.find((item) => minute >= item.on - 1 && minute <= item.off);
+  return window ? maskWindowLabel(window) : null;
 }
 
 export function buildSessionClusters(groupId, files, dailyRows = []) {
